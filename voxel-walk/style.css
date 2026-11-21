@@ -189,6 +189,27 @@ html, body {
   background: #2d3e58;
 }
 
+.btn-github {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-decoration: none;
+  background: #0f1724;
+  color: var(--text-main);
+  border-color: #3a4d6a;
+}
+
+.btn-github:hover {
+  background: #1c293e;
+  border-color: #5b769e;
+}
+
+.github-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
 .canvas-stage {
   position: relative;
   flex: 1 1 auto;
