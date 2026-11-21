@@ -25,6 +25,7 @@
     sliceSpacingMult: 1.0,
     maxVisibleSlice: world.maxUsedSlice,
     useAO: true,
+    useEdgeHighlight: true,
     pixelated: true,
     showWireframe: false,
   };
@@ -105,6 +106,7 @@
   const valPitch = document.getElementById("val-pitch");
 
   const chkAO = document.getElementById("chk-ao");
+  const chkEdge = document.getElementById("chk-edge");
   const chkPixelated = document.getElementById("chk-pixelated");
   const chkWireframe = document.getElementById("chk-wireframe");
 
@@ -513,6 +515,7 @@
   });
 
   chkAO.addEventListener("change", () => (settings.useAO = chkAO.checked));
+  chkEdge.addEventListener("change", () => (settings.useEdgeHighlight = chkEdge.checked));
   chkPixelated.addEventListener("change", () => (settings.pixelated = chkPixelated.checked));
   chkWireframe.addEventListener("change", () => (settings.showWireframe = chkWireframe.checked));
 

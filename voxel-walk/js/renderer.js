@@ -51,7 +51,7 @@
     const liftPerSlice = Math.cos(pitchRad) * cam.zoom * settings.sliceSpacingMult;
     const blockScreenPx = BLOCK_SIZE * cam.zoom;
 
-    const worldSlices = settings.useAO ? world.slicesAO : world.slicesFlat;
+    const worldSlices = world.getSlices(settings.useAO, settings.useEdgeHighlight);
 
     // プレイヤーの現在ポーズのスライス配列を選択
     let playerSlices = PLAYER_POSES.idle;

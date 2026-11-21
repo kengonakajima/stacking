@@ -84,6 +84,9 @@
     setBlock(6, 7, 2, BLOCK_DIRT);
     setBlock(6, 6, 3, BLOCK_DIRT);
 
+    // 2.5. 平らな中央広場の上に「1ブロックだけ突き出た草ブロック」を配置（上側の角の視認性テスト用）
+    setBlock(9, 8, 2, BLOCK_GRASS);
+
     // 3. 中央付近に「下をくぐれて、上も歩ける」立体アーチ橋を作る
     //    (x = 13..14, y = 7..13, 橋桁は z = 4、柱は y=7 と y=13)
     //    下は z=2, z=3 が空洞（2ブロック分の高さがあるのでプレイヤーが通れる！）
@@ -123,12 +126,13 @@
       return 0; // 上空は開けている
     }
 
-    // ワールドの水平断面スライス配列（useAO の ON/OFF 2種類をキャッシュ）
+    // ワールドの水平断面スライス配列（AO / 段差エッジ強調の組み合わせごとに遅延キャッシュ）
     const totalSlices = WORLD_Z * BLOCK_SLICES;
     const canvasW = WORLD_X * BLOCK_SIZE;
     const canvasH = WORLD_Y * BLOCK_SIZE;
+    const sliceCache = Object.create(null);
 
-    function bakeSlices(enableAO) {
+    function bakeSlices(enableAO, enableEdge) {
       const slices = [];
 
       // AO有効時、側面1ブロックごとの周囲遮蔽情報（下辺接地・上辺軒下・左右内角・上空影）を計算
@@ -162,6 +166,8 @@
         const bz = Math.floor(sliceZ / BLOCK_SLICES);
         const lz = sliceZ % BLOCK_SLICES;
         const isTopSlice = lz === BLOCK_SLICES - 1;
+        // 標高が高い段ほど明るくして、重なり合う平らな面同士を高さで見分けやすくする
+        const elevLight = enableEdge ? 0.80 + bz * 0.095 : 1.0;
 
         const c = document.createElement("canvas");
         c.width = canvasW;
@@ -182,6 +188,23 @@
             let aoN = false, aoS = false, aoW = false, aoE = false;
             let aoNW = false, aoNE = false, aoSW = false, aoSE = false;
             let topSkyFactor = 1.0;
+
+            // --- 上面の露出段差エッジ（同じ高さ bz の隣が空＝崖のフチ）判定 ---
+            let dropN = false, dropS = false, dropW = false, dropE = false;
+            let dropNW = false, dropNE = false, dropSW = false, dropSE = false;
+            const hasAirAbove = isTopSlice && getBlock(bx, by, bz + 1) === BLOCK_AIR;
+
+            if (enableEdge && hasAirAbove) {
+              dropN = getBlock(bx, by - 1, bz) === BLOCK_AIR;
+              dropS = getBlock(bx, by + 1, bz) === BLOCK_AIR;
+              dropW = getBlock(bx - 1, by, bz) === BLOCK_AIR;
+              dropE = getBlock(bx + 1, by, bz) === BLOCK_AIR;
+              // L字台地の内角でも輪郭線が途切れないよう対角の落ち込みも判定
+              dropNW = !dropN && !dropW && getBlock(bx - 1, by - 1, bz) === BLOCK_AIR;
+              dropNE = !dropN && !dropE && getBlock(bx + 1, by - 1, bz) === BLOCK_AIR;
+              dropSW = !dropS && !dropW && getBlock(bx - 1, by + 1, bz) === BLOCK_AIR;
+              dropSE = !dropS && !dropE && getBlock(bx + 1, by + 1, bz) === BLOCK_AIR;
+            }
 
             // --- 垂直面（東西南北）の 3D AO 事前判定 ---
             let sideN = null, sideS = null, sideW = null, sideE = null;
@@ -226,6 +249,8 @@
               for (let lx = 0; lx < BLOCK_SIZE; lx++) {
                 const px = bx * BLOCK_SIZE + lx;
                 let [r, g, b] = sampleBlockColor(type, lx, ly, lz, variant);
+
+                let lightMult = elevLight;
 
                 if (enableAO) {
                   let ao = 1.0;
@@ -281,9 +306,43 @@
                     if (lx >= BLOCK_SIZE - 2 && sideE) ao = Math.min(ao, calcFaceAO(sideE, ly));
                   }
 
-                  if (ao < 0.999) {
-                    [r, g, b] = shadeColor(r, g, b, Math.max(0.28, ao));
+                  lightMult *= Math.max(0.28, ao);
+                }
+
+                // 段差エッジ強調：突き出たブロックの上面の外周（崖のフチ）に
+                // 「1px 暗い輪郭線 ＋ 内側1px 明るいベベル」を入れて背景の平面からくっきり分離させる
+                if (enableEdge && hasAirAbove) {
+                  const isOuterContour =
+                    (dropN && ly === 0) ||
+                    (dropS && ly === BLOCK_SIZE - 1) ||
+                    (dropW && lx === 0) ||
+                    (dropE && lx === BLOCK_SIZE - 1) ||
+                    (dropNW && lx === 0 && ly === 0) ||
+                    (dropNE && lx === BLOCK_SIZE - 1 && ly === 0) ||
+                    (dropSW && lx === 0 && ly === BLOCK_SIZE - 1) ||
+                    (dropSE && lx === BLOCK_SIZE - 1 && ly === BLOCK_SIZE - 1);
+
+                  if (isOuterContour) {
+                    lightMult *= 0.60;
+                  } else {
+                    const isInnerBevel =
+                      (dropN && ly === 1) ||
+                      (dropS && ly === BLOCK_SIZE - 2) ||
+                      (dropW && lx === 1) ||
+                      (dropE && lx === BLOCK_SIZE - 2) ||
+                      (dropNW && lx <= 1 && ly <= 1) ||
+                      (dropNE && lx >= BLOCK_SIZE - 2 && ly <= 1) ||
+                      (dropSW && lx <= 1 && ly >= BLOCK_SIZE - 2) ||
+                      (dropSE && lx >= BLOCK_SIZE - 2 && ly >= BLOCK_SIZE - 2);
+
+                    if (isInnerBevel) {
+                      lightMult *= 1.18;
+                    }
                   }
+                }
+
+                if (Math.abs(lightMult - 1.0) > 0.002) {
+                  [r, g, b] = shadeColor(r, g, b, Math.max(0.25, lightMult));
                 }
 
                 const idx = (py * canvasW + px) * 4;
@@ -305,13 +364,20 @@
       return slices;
     }
 
-    const slicesAO = bakeSlices(true);
-    const slicesFlat = bakeSlices(false);
+    function getSlices(enableAO, enableEdge) {
+      const key = `${enableAO ? 1 : 0}_${enableEdge ? 1 : 0}`;
+      if (!sliceCache[key]) {
+        sliceCache[key] = bakeSlices(enableAO, enableEdge);
+      }
+      return sliceCache[key];
+    }
+
+    const defaultSlices = getSlices(true, true);
 
     // 実際にブロックが存在する最上位スライス番号を求める
     let maxUsedSlice = 0;
     for (let s = totalSlices - 1; s >= 0; s--) {
-      if (slicesAO[s]) {
+      if (defaultSlices[s]) {
         maxUsedSlice = s + 1;
         break;
       }
@@ -345,8 +411,7 @@
       setBlock,
       inBounds,
       findFloorBelow,
-      slicesAO,
-      slicesFlat,
+      getSlices,
     };
   }
 
