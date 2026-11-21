@@ -62,8 +62,10 @@
     precision highp sampler3D;
 
     uniform sampler2DArray uTerrainTex; // 768x768 x N slices (RGBA8)
-    uniform sampler2DArray uWaterTex;   // 128x128 x 14 layers (RG8: R=visLevel 0..8, G=flags: 1=fall, 2=solid, 4=lava, 8=torch)
+    uniform sampler2DArray uWaterTex;   // 128x128 x 14 layers (RG8: R=visLevel 0..8, G=flags: 1=fall, 2=solid, 4=lava, 8=torch, 16=tree, 32=leaves)
     uniform sampler3D uLightTex;        // 128x128 x 14 (RG8, LINEAR: R=blockLight, G=skyLight)
+    uniform sampler2D uTreeSwayTex;     // 128x128 (RGBA8, NEAREST: RG=swayXY, B=(baseBz<<4)|heightBlocks, A=hitEnergy)
+    uniform vec2 uYawCS;                // 隣接する葉ブロック重なり時の前後ソート用
 
     uniform vec2 uWorldSize;
     uniform int uWorldZ;
@@ -172,6 +174,53 @@
       return min(vec3(1.22), baseDark + skyCol + blockCol * (1.0 - sL * 0.42));
     }
 
+    // 1ブロック丸ごと形を崩さず剛体として揺らすための、ブロックごとの独立変位を計算
+    // （同じブロックの全8スライス＋上面キャップが完全に同じ変位を共有するため波打たない！）
+    vec2 computeRigidTreeBlockOffset(ivec2 cell, int ownerBz, bool isLeaf, vec4 treeInfo) {
+      int meta = int(floor(treeInfo.b * 255.0 + 0.5));
+      int baseBz = meta >> 4;
+      int heightBlocks = max(1, meta & 15);
+      int relZ = ownerBz - baseBz;
+      if (relZ <= 0 && !isLeaf) {
+        // 地面に接する幹の一番下は完全固定
+        return vec2(0.0);
+      }
+
+      float hNorm = clamp(float(relZ) / max(1.0, float(heightBlocks - 1)), 0.0, 1.0);
+      vec2 treeSway = ((treeInfo.rg * 255.0 - 128.0) / 127.0) * 0.36;
+      float hitEnergy = treeInfo.a;
+
+      // 幹は控えめに剛体シフト、葉は木全体のしなり＋各ブロック固有のランダム方向へ独立に揺れる
+      vec2 disp = treeSway * (isLeaf ? (0.45 + 0.55 * hNorm) : (hNorm * 0.35));
+
+      if (isLeaf) {
+        vec2 h2 = hash22(vec2(cell) + vec2(float(ownerBz) * 19.7, float(ownerBz) * 37.3));
+        float ang = h2.x * 6.2831853;
+        float phase = h2.y * 6.2831853;
+        vec2 dirA = vec2(cos(ang), sin(ang));
+        vec2 dirB = vec2(-dirA.y, dirA.x);
+
+        // そよ風：ブロックごとに異なる向きへゆったり独立揺れ（多方向で自然！）
+        float freqA = 1.65 + h2.x * 0.95;
+        float freqB = 1.15 + h2.y * 0.75;
+        vec2 leafWind =
+          dirA * (sin(uTime * freqA + phase) * 0.085) +
+          dirB * (cos(uTime * freqB + phase * 1.3) * 0.055);
+
+        // プレイヤー衝突時：ブロックごとにバラバラの方向へ元気にガサガサ弾む！（サイン波的なうねりなし）
+        float hitFreq = 14.0 + h2.y * 6.5;
+        float hitAmp = hitEnergy * hitEnergy * 0.24;
+        vec2 leafHit =
+          dirA * (sin(uTime * hitFreq + phase) * hitAmp) +
+          dirB * (cos(uTime * (hitFreq * 0.83) + ang) * (hitAmp * 0.72));
+
+        disp += leafWind + leafHit;
+      }
+
+      // 2x2 近傍探索で漏れゼロを保証するため最大 ±0.44 ブロックにクランプ
+      return clamp(disp, vec2(-0.44), vec2(0.44));
+    }
+
     void main() {
       vec2 uv = vBlockPos / uWorldSize;
       if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) discard;
@@ -180,15 +229,90 @@
       int lz = vSliceZ - bz * 8;
       ivec2 bxy = ivec2(floor(vBlockPos));
 
-      // 1. 固体地形スライス評価
+      // 1. 固体地形スライス評価（各木ブロックが形を崩さず剛体として独立に揺れる 2x2 探索）
       if (uMode != 2 && vSliceZ < uTerrainLayers) {
-        vec4 tCol = texture(uTerrainTex, vec3(uv, float(vSliceZ)));
+        bool isBlockPlane = (lz == 0);
+        int curFlags = sampleWaterCell(bxy, bz).y;
+
+        vec4 tCol = vec4(0.0);
+        bool drewTree = false;
+        ivec2 effBxy = bxy;
+        int effFlags = curFlags;
+        vec2 effBlockPos = vBlockPos;
+
+        ivec2 clampedBxy = clamp(bxy, ivec2(0), ivec2(uWorldSize) - 1);
+        vec4 treeInfo = texelFetch(uTreeSwayTex, clampedBxy, 0);
+        int treeMeta = int(floor(treeInfo.b * 255.0 + 0.5));
+        if (treeMeta > 0) {
+          int treeBaseSlice = (treeMeta >> 4) * 8;
+          if (vSliceZ >= treeBaseSlice) {
+            vec2 fxy = fract(vBlockPos);
+            int stepX = (fxy.x < 0.5) ? -1 : 1;
+            int stepY = (fxy.y < 0.5) ? -1 : 1;
+            float bestDepth = -1e9;
+
+            for (int k = 0; k < 4; k++) {
+              int ox = (k == 1 || k == 3) ? stepX : 0;
+              int oy = (k == 2 || k == 3) ? stepY : 0;
+              ivec2 cand = bxy + ivec2(ox, oy);
+              if (cand.x < 0 || cand.y < 0 || cand.x >= int(uWorldSize.x) || cand.y >= int(uWorldSize.y)) {
+                continue;
+              }
+
+              int cFlags = sampleWaterCell(cand, bz).y;
+              int ownerBz = -1;
+              bool isLeaf = false;
+              if ((cFlags & 16) != 0) {
+                ownerBz = bz;
+                isLeaf = (cFlags & 32) != 0;
+              } else if (isBlockPlane && bz > 0 && (cFlags & 2) == 0) {
+                int belowFlags = sampleWaterCell(cand, bz - 1).y;
+                if ((belowFlags & 16) != 0) {
+                  ownerBz = bz - 1;
+                  isLeaf = (belowFlags & 32) != 0;
+                }
+              }
+              if (ownerBz < 0) continue;
+
+              vec4 candTree = texelFetch(uTreeSwayTex, cand, 0);
+              if (int(floor(candTree.b * 255.0 + 0.5)) == 0) continue;
+
+              vec2 disp = computeRigidTreeBlockOffset(cand, ownerBz, isLeaf, candTree);
+              vec2 local = vBlockPos - (vec2(cand) + disp);
+              if (local.x >= 0.0 && local.x < 1.0 && local.y >= 0.0 && local.y < 1.0) {
+                float camDepth = float(cand.x) * uYawCS.y + float(cand.y) * uYawCS.x;
+                if (camDepth > bestDepth) {
+                  vec2 srcBlockPos = vec2(cand) + clamp(local, vec2(0.002), vec2(0.998));
+                  vec4 candCol = texture(uTerrainTex, vec3(srcBlockPos / uWorldSize, float(vSliceZ)));
+                  if (candCol.a > 0.5) {
+                    bestDepth = camDepth;
+                    tCol = candCol;
+                    drewTree = true;
+                    effBxy = cand;
+                    effFlags = cFlags;
+                    effBlockPos = srcBlockPos;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // 木以外の通常地形（元の位置に残る木のゴーストは描かない）
+        if (!drewTree) {
+          bool curIsTree = (curFlags & 16) != 0;
+          if (!curIsTree && isBlockPlane && bz > 0 && (curFlags & 2) == 0) {
+            curIsTree = (sampleWaterCell(bxy, bz - 1).y & 16) != 0;
+          }
+          if (!curIsTree) {
+            tCol = texture(uTerrainTex, vec3(uv, float(vSliceZ)));
+          }
+        }
+
         if (tCol.a > 0.5) {
           // 溶岩ブロック判定（自己発光アニメーション：夜でも真っ赤に輝く！）
-          bool isBlockPlane = (lz == 0);
-          int curFlags = sampleWaterCell(bxy, bz).y;
-          bool isLava = (curFlags & 4) != 0;
-          if (!isLava && isBlockPlane && bz > 0 && (curFlags & 2) == 0) {
+          bool isLava = !drewTree && (curFlags & 4) != 0;
+          if (!drewTree && !isLava && isBlockPlane && bz > 0 && (curFlags & 2) == 0) {
             isLava = (sampleWaterCell(bxy, bz - 1).y & 4) != 0;
           }
 
@@ -223,8 +347,8 @@
                 bool isExposedRoof =
                   isBlockPlane &&
                   bz > 0 &&
-                  ((sampleWaterCell(bxy, bz - 1).y & 2) != 0) &&
-                  ((curFlags & 2) == 0);
+                  ((sampleWaterCell(effBxy, bz - 1).y & 2) != 0) &&
+                  ((effFlags & 2) == 0);
 
                 if (uXrayMode == 1) {
                   if (isExposedRoof) {
@@ -237,11 +361,11 @@
                 } else {
                   if (isExposedRoof) {
                     int roofBz = bz - 1;
-                    vec2 fxy = fract(vBlockPos);
-                    bool edgeW = fxy.x < 0.16 && ((sampleWaterCell(bxy + ivec2(-1, 0), roofBz).y & 2) == 0);
-                    bool edgeE = fxy.x > 0.84 && ((sampleWaterCell(bxy + ivec2(1, 0), roofBz).y & 2) == 0);
-                    bool edgeN = fxy.y < 0.16 && ((sampleWaterCell(bxy + ivec2(0, -1), roofBz).y & 2) == 0);
-                    bool edgeS = fxy.y > 0.84 && ((sampleWaterCell(bxy + ivec2(0, 1), roofBz).y & 2) == 0);
+                    vec2 fxy = fract(effBlockPos);
+                    bool edgeW = fxy.x < 0.16 && ((sampleWaterCell(effBxy + ivec2(-1, 0), roofBz).y & 2) == 0);
+                    bool edgeE = fxy.x > 0.84 && ((sampleWaterCell(effBxy + ivec2(1, 0), roofBz).y & 2) == 0);
+                    bool edgeN = fxy.y < 0.16 && ((sampleWaterCell(effBxy + ivec2(0, -1), roofBz).y & 2) == 0);
+                    bool edgeS = fxy.y > 0.84 && ((sampleWaterCell(effBxy + ivec2(0, 1), roofBz).y & 2) == 0);
                     if (edgeW || edgeE || edgeN || edgeS) {
                       vec3 contourCol = mix(finalRgb + vec3(0.18), vec3(0.60, 0.88, 1.0), 0.55);
                       outColor = vec4(contourCol, 0.42 * mask + (1.0 - mask));
@@ -507,6 +631,7 @@
       uTerrainTex: gl.getUniformLocation(worldProg, "uTerrainTex"),
       uWaterTex: gl.getUniformLocation(worldProg, "uWaterTex"),
       uLightTex: gl.getUniformLocation(worldProg, "uLightTex"),
+      uTreeSwayTex: gl.getUniformLocation(worldProg, "uTreeSwayTex"),
       uWorldZ: gl.getUniformLocation(worldProg, "uWorldZ"),
       uTerrainLayers: gl.getUniformLocation(worldProg, "uTerrainLayers"),
       uTime: gl.getUniformLocation(worldProg, "uTime"),
@@ -579,6 +704,8 @@
     let uploadedWaterVer = -1;
     let lightTex = null;
     let uploadedLightVer = -1;
+    let treeSwayTex = null;
+    let uploadedTreeSwayVer = -1;
     let lastPixelated = true;
 
     function syncTerrainTexture(world, useAO, useEdge) {
@@ -692,6 +819,39 @@
       }
     }
 
+    function syncTreeSwayTexture(world) {
+      if (boundWorld !== world || !treeSwayTex) {
+        if (treeSwayTex) gl.deleteTexture(treeSwayTex);
+        treeSwayTex = gl.createTexture();
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.bindTexture(gl.TEXTURE_2D, treeSwayTex);
+        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, world.sizeX, world.sizeY);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        uploadedTreeSwayVer = -1;
+      }
+
+      const curVer = world.getTreeSwayVersion();
+      if (curVer !== uploadedTreeSwayVer) {
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.bindTexture(gl.TEXTURE_2D, treeSwayTex);
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          0,
+          0,
+          world.sizeX,
+          world.sizeY,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          world.treeSwayBytes
+        );
+        uploadedTreeSwayVer = curVer;
+      }
+    }
+
     function updateFilterMode(pixelated) {
       if (pixelated === lastPixelated) return;
       lastPixelated = pixelated;
@@ -712,6 +872,7 @@
       syncTerrainTexture(world, settings.useAO, settings.useEdgeHighlight);
       const waterUploaded = syncWaterTexture(world);
       syncLightTexture(world);
+      syncTreeSwayTexture(world);
       boundWorld = world;
       updateFilterMode(settings.pixelated);
 
@@ -842,6 +1003,9 @@
         gl.activeTexture(gl.TEXTURE3);
         gl.bindTexture(gl.TEXTURE_3D, lightTex);
         gl.uniform1i(wLoc.uLightTex, 3);
+        gl.activeTexture(gl.TEXTURE4);
+        gl.bindTexture(gl.TEXTURE_2D, treeSwayTex);
+        gl.uniform1i(wLoc.uTreeSwayTex, 4);
 
         gl.uniform2f(wLoc.uViewport, viewW, viewH);
         gl.uniform2f(wLoc.uCenter, centerX, centerY);

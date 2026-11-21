@@ -183,15 +183,15 @@
     let bgTop = [93, 169, 233];
     let bgBot = [184, 225, 255];
 
-    if (h >= 8 && h < 16) {
-      // 昼
+    if (h >= 7 && h < 18) {
+      // 昼（7:00 -> 18:00：たっぷり長めの昼間）
       sun = 1.0;
       lightCol = [1.0, 0.99, 0.96];
       bgTop = [93, 169, 233];
       bgBot = [184, 225, 255];
-    } else if (h >= 16 && h < 19.5) {
-      // 夕方（16:00 -> 19:30）
-      const t = (h - 16) / 3.5;
+    } else if (h >= 18 && h < 20) {
+      // 夕方（18:00 -> 20:00）
+      const t = (h - 18) / 2.0;
       if (t < 0.55) {
         const u = t / 0.55;
         sun = lerp(1.0, 0.42, u);
@@ -205,15 +205,15 @@
         bgTop = lerpRGB([46, 36, 92], [3, 6, 15], u);
         bgBot = lerpRGB([236, 114, 52], [9, 16, 34], u);
       }
-    } else if (h >= 19.5 || h < 4.5) {
-      // 夜（ほぼ真っ暗！）
+    } else if (h >= 20 || h < 5) {
+      // 夜（20:00 -> 5:00：真っ暗だが時間進行を早めて短めに）
       sun = 0.032;
       lightCol = [0.24, 0.34, 0.58];
       bgTop = [3, 6, 15];
       bgBot = [9, 16, 34];
     } else {
-      // 夜明け（4:30 -> 8:00）
-      const t = (h - 4.5) / 3.5;
+      // 夜明け（5:00 -> 7:00）
+      const t = (h - 5) / 2.0;
       if (t < 0.45) {
         const u = t / 0.45;
         sun = lerp(0.032, 0.45, u);
@@ -234,7 +234,7 @@
 
     const hh = String(Math.floor(h)).padStart(2, "0");
     const mm = String(Math.floor((h - Math.floor(h)) * 60)).padStart(2, "0");
-    const label = h >= 19.5 || h < 4.5 ? "夜" : h >= 16 ? "夕" : h < 8 ? "朝" : "昼";
+    const label = h >= 20 || h < 5 ? "夜" : h >= 18 ? "夕" : h < 7 ? "朝" : "昼";
     const timeText = `${hh}:${mm} (${label})`;
     hudTime.textContent = timeText;
     valTime.textContent = timeText;
@@ -874,13 +874,17 @@
       fpsWindowStart = now;
     }
 
-    // 昼夜サイクル進行（1日24時間 = 約96秒）
+    // 昼夜サイクル進行（昼44秒・朝夕各8秒・夜は2.5倍速で約14.5秒と短めに）
     if (settings.autoTime) {
-      settings.timeOfDay = (settings.timeOfDay + dt * 0.25) % 24;
+      const h = ((settings.timeOfDay % 24) + 24) % 24;
+      const isNight = h >= 20 || h < 5;
+      const hoursPerSec = isNight ? 0.62 : 0.25;
+      settings.timeOfDay = (settings.timeOfDay + dt * hoursPerSec) % 24;
     }
     updateDayNightLighting();
 
     updatePlayer(dt);
+    world.updateTrees(dt, now * 0.001, player);
 
     // 水流ステップ計測
     waterAccum += dt;

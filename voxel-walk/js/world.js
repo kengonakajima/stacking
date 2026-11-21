@@ -466,6 +466,155 @@
     }
 
     // ============================================================
+    // 4.5 木の風揺れ＆プレイヤー衝突バネ振動システム（ブロック単位の剛体揺れ）
+    // ============================================================
+    // RGBA8: R=swayX, G=swayY, B=(baseBz<<4)|heightBlocks (0=木なし), A=hitEnergy(0..255)
+    const treeSwayBytes = new Uint8Array(WORLD_X * WORLD_Y * 4);
+    for (let p = 0; p < WORLD_X * WORLD_Y; p++) {
+      treeSwayBytes[p * 4] = 128;
+      treeSwayBytes[p * 4 + 1] = 128;
+      treeSwayBytes[p * 4 + 2] = 0;
+      treeSwayBytes[p * 4 + 3] = 0;
+    }
+
+    const trees = treePositions.map((tp, idx) => ({
+      x: tp.x,
+      y: tp.y,
+      topZ: tp.topZ,
+      trunkH: tp.trunkH,
+      baseBz: tp.topZ + 1,
+      heightBlocks: tp.trunkH + 2,
+      phase: hash3(tp.x, tp.y, seed + 1234 + idx) * Math.PI * 2,
+      shakeX: 0,
+      shakeY: 0,
+      velX: 0,
+      velY: 0,
+      hitEnergy: 0,
+      hitCooldown: 0,
+      cells: [],
+    }));
+
+    // 各木の 5×5 周辺セルを最も近い木へ割り当て（隣の木と干渉ゼロ）
+    const treeOwner = new Int16Array(WORLD_X * WORLD_Y);
+    treeOwner.fill(-1);
+    const treeOwnerDist = new Float32Array(WORLD_X * WORLD_Y);
+    treeOwnerDist.fill(999);
+    for (let ti = 0; ti < trees.length; ti++) {
+      const t = trees[ti];
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const cx = t.x + dx;
+          const cy = t.y + dy;
+          if (cx < 0 || cy < 0 || cx >= WORLD_X || cy >= WORLD_Y) continue;
+          const d2 = dx * dx + dy * dy;
+          const p = cy * WORLD_X + cx;
+          if (d2 < treeOwnerDist[p]) {
+            treeOwnerDist[p] = d2;
+            treeOwner[p] = ti;
+          }
+        }
+      }
+    }
+    for (let p = 0; p < WORLD_X * WORLD_Y; p++) {
+      const ti = treeOwner[p];
+      if (ti >= 0) {
+        const t = trees[ti];
+        t.cells.push(p);
+        treeSwayBytes[p * 4 + 2] = ((t.baseBz & 15) << 4) | (t.heightBlocks & 15);
+        treeSwayBytes[p * 4 + 3] = 0;
+      }
+    }
+
+    let treeSwayVersion = 0;
+
+    function updateTrees(dt, timeSec, player) {
+      const stepDt = Math.min(0.04, Math.max(0.001, dt));
+      const pX = player ? player.x : -999;
+      const pY = player ? player.y : -999;
+      const pZ = player ? player.z : -999;
+      const pH = player ? player.height : 1.5;
+      const pMoving = player ? player.isMoving : false;
+      const pVz = player ? Math.abs(player.vz) : 0;
+
+      for (let i = 0; i < trees.length; i++) {
+        const t = trees[i];
+        if (t.hitCooldown > 0) {
+          t.hitCooldown = Math.max(0, t.hitCooldown - stepDt);
+        }
+
+        // プレイヤーとの衝突・接触で幹の反動＋葉ブロック個別ワサワサエネルギーを注入
+        if (player) {
+          const dx = t.x + 0.5 - pX;
+          const dy = t.y + 0.5 - pY;
+          const distSq = dx * dx + dy * dy;
+          if (distSq < 3.25) {
+            const dist = Math.sqrt(distSq);
+            const trunkHit =
+              dist < 1.08 && pZ + pH >= t.topZ + 0.8 && pZ <= t.topZ + t.trunkH + 0.35;
+            const canopyHit =
+              dist < 1.78 && pZ + pH >= t.topZ + t.trunkH && pZ <= t.topZ + t.trunkH + 2.4;
+
+            if ((trunkHit || canopyHit) && t.hitCooldown <= 0 && (pMoving || pVz > 0.6 || dist < 0.86)) {
+              const invD = dist > 0.05 ? 1 / dist : 1;
+              const nx = dist > 0.05 ? dx * invD : Math.cos(player.facing || 0);
+              const ny = dist > 0.05 ? dy * invD : Math.sin(player.facing || 0);
+              const kick = trunkHit ? (pMoving ? 3.8 : 2.1) : 2.8;
+              const perp = (Math.sin(timeSec * 17.0 + t.phase) >= 0 ? 1 : -1) * 1.1;
+              t.velX += nx * kick - ny * perp;
+              t.velY += ny * kick + nx * perp;
+              t.hitEnergy = Math.min(1.0, Math.max(t.hitEnergy, trunkHit ? 1.0 : 0.78));
+              t.hitCooldown = trunkHit ? 0.22 : 0.28;
+            }
+          }
+        }
+
+        // 衝撃エネルギーの自然な減衰（約1.1秒かけて落ち着く）
+        if (t.hitEnergy > 0) {
+          t.hitEnergy = Math.max(0, t.hitEnergy - stepDt * 1.15);
+        }
+
+        // 木全体のキレのあるバネ反動（グニャグニャではなくスッと跳ね返る硬めのバネ）
+        const ax = -78.0 * t.shakeX - 5.2 * t.velX;
+        const ay = -78.0 * t.shakeY - 5.2 * t.velY;
+        t.velX += ax * stepDt;
+        t.velY += ay * stepDt;
+        t.shakeX += t.velX * stepDt;
+        t.shakeY += t.velY * stepDt;
+        if (Math.abs(t.shakeX) < 0.0004 && Math.abs(t.velX) < 0.001) {
+          t.shakeX = 0;
+          t.velX = 0;
+        }
+        if (Math.abs(t.shakeY) < 0.0004 && Math.abs(t.velY) < 0.001) {
+          t.shakeY = 0;
+          t.velY = 0;
+        }
+
+        // 風の向きを画面横〜斜め方向 (+0.86, -0.68) ベース＋ゆるやかな旋回にして縦揺れ偏りを解消
+        const gustWave = 0.62 + 0.38 * Math.sin(timeSec * 0.7 - (t.x * 0.09 - t.y * 0.07));
+        const swayMain = Math.sin(timeSec * 1.7 + t.phase + t.x * 0.14 - t.y * 0.11);
+        const swayCross = Math.cos(timeSec * 1.15 + t.phase * 1.4);
+        const windX = swayMain * gustWave * 0.085 + swayCross * 0.035;
+        const windY = -swayMain * gustWave * 0.068 + Math.sin(timeSec * 1.35 + t.phase) * 0.038;
+
+        const maxSway = 0.36;
+        const totalX = Math.max(-maxSway, Math.min(maxSway, windX + t.shakeX));
+        const totalY = Math.max(-maxSway, Math.min(maxSway, windY + t.shakeY));
+        const encX = Math.max(1, Math.min(255, Math.round(128 + (totalX / maxSway) * 127)));
+        const encY = Math.max(1, Math.min(255, Math.round(128 + (totalY / maxSway) * 127)));
+        const encHit = Math.max(0, Math.min(255, Math.round(t.hitEnergy * 255)));
+
+        const cells = t.cells;
+        for (let k = 0; k < cells.length; k++) {
+          const off = cells[k] * 4;
+          treeSwayBytes[off] = encX;
+          treeSwayBytes[off + 1] = encY;
+          treeSwayBytes[off + 3] = encHit;
+        }
+      }
+      treeSwayVersion++;
+    }
+
+    // ============================================================
     // 5. 高速ゼロアロケーション 3D AO ＋ 段差エッジ ＋ 境界天面キャップベイク
     // ============================================================
     const totalSlices = WORLD_Z * BLOCK_SLICES + 1;
@@ -1085,13 +1234,15 @@
         for (let p = 0; p < WORLD_X * WORLD_Y; p++) {
           const idx = baseIdx + p;
           const visLevel = waterToVisualLevel(water[idx]);
-          // Gチャンネルフラグ: bit0=滝落下, bit1=固体, bit2=溶岩, bit3=松明
+          // Gチャンネルフラグ: bit0=滝落下, bit1=固体, bit2=溶岩, bit3=松明, bit4=木(幹/葉), bit5=葉
           const b = blocks[idx];
           const flags =
             (falling[idx] ? 1 : 0) |
             (b !== BLOCK_AIR ? 2 : 0) |
             (b === BLOCK_LAVA ? 4 : 0) |
-            (torches[idx] ? 8 : 0);
+            (torches[idx] ? 8 : 0) |
+            (b === BLOCK_WOOD || b === BLOCK_LEAVES ? 16 : 0) |
+            (b === BLOCK_LEAVES ? 32 : 0);
           out[p * 2] = visLevel;
           out[p * 2 + 1] = flags;
         }
@@ -1439,6 +1590,9 @@
       getWaterTexVersion: () => waterTexVersion,
       lightTexBytes,
       getLightTexVersion: () => lightTexVersion,
+      treeSwayBytes,
+      getTreeSwayVersion: () => treeSwayVersion,
+      updateTrees,
       placeTorchAt,
       removeTorchNear,
       getTorchCount: () => torchCount,
