@@ -66,13 +66,22 @@
     precision highp sampler2DArray;
 
     uniform sampler2DArray uTerrainTex; // 768x768 x N slices (RGBA8)
-    uniform sampler2DArray uWaterTex;   // 128x128 x 12 layers (RG8: R=visLevel 0..8, G=bit0:fall | bit1:solid)
+    uniform sampler2DArray uWaterTex;   // 128x128 x 14 layers (RG8: R=visLevel 0..8, G=bit0:fall | bit1:solid)
     uniform vec2 uWorldSize;            // (128, 128)
-    uniform int uWorldZ;                // 12
+    uniform int uWorldZ;                // 14
     uniform int uTerrainLayers;
     uniform float uTime;
     uniform int uMode;                  // 0=地形+水, 1=地形のみ, 2=水のみ
     uniform int uWireframe;
+
+    // 洞窟・遮蔽時の X-Ray 透視カットアウト＆松明ライト用 uniform
+    uniform vec2 uPlayerScreenPos;      // プレイヤー中心の画面座標（左下原点 = gl_FragCoord 系）
+    uniform vec3 uPlayerWorldPos;       // プレイヤーの3Dワールド座標（洞窟内の松明ライト用）
+    uniform int uPlayerBaseSlice;       // プレイヤー足元のスライス高さ
+    uniform float uBlockPx;             // 1ブロックの画面ピクセル幅
+    uniform float uOcclusionFade;       // 0.0 (非遮蔽) .. 1.0 (洞窟/崖裏で遮蔽中)
+    uniform float uXrayRadiusPx;        // 透視窓の半径 (px)
+    uniform int uXrayMode;              // 0=輪郭線のみ(外表面), 1=うっすら半透明(外表面1層), 2=完全切り抜き
 
     in vec2 vBlockPos;
     flat in int vSliceZ;
@@ -141,6 +150,84 @@
               tCol.rgb = mix(tCol.rgb, vec3(1.0), 0.35);
             }
           }
+
+          // ★ 洞窟・崖裏の X-Ray 透視処理
+          //   - プレイヤーすぐ手前の狭い範囲 (1.35 blk) は膝上から切り抜いて自機を確実に視認
+          //   - 広い透視窓 (uXrayRadiusPx) は頭上 (+12スライス=1.5blk) から切り抜き、
+          //     洞窟の床と周囲の壁をしっかり残しつつ天井の山だけをスッキリ透過させる！
+          if (uOcclusionFade > 0.01) {
+            float screenDist = length(gl_FragCoord.xy - uPlayerScreenPos);
+            int cutSlice = (screenDist < uBlockPx * 1.35) ? (uPlayerBaseSlice + 4) : (uPlayerBaseSlice + 12);
+
+            if (vSliceZ >= cutSlice && screenDist < uXrayRadiusPx) {
+              float mask = (1.0 - smoothstep(uXrayRadiusPx * 0.78, uXrayRadiusPx, screenDist)) * uOcclusionFade;
+              if (mask > 0.15) {
+                if (uXrayMode == 2) {
+                  // モード2: 完全切り抜き（洞窟内部が100%くっきり見える）
+                  if (mask > 0.45) discard;
+                  outColor = vec4(tCol.rgb, 1.0 - mask * 1.6);
+                  return;
+                }
+
+                // 山や天井の「一番外側の露出天面（1層だけ）」かどうかを判定
+                // ※ 埋没した内部の何十層ものスライスはすべて discard するため網目だらけにならない！
+                bool isBlockPlane = (vSliceZ % 8) == 0;
+                int curBz = vSliceZ / 8;
+                ivec2 bxy = ivec2(floor(vBlockPos));
+                bool isExposedRoof =
+                  isBlockPlane &&
+                  curBz > 0 &&
+                  ((sampleWaterCell(bxy, curBz - 1).y & 2) != 0) &&
+                  ((sampleWaterCell(bxy, curBz).y & 2) == 0);
+
+                if (uXrayMode == 1) {
+                  // モード1: 外表面1層だけをうっすら半透明（フォグ化せず山の形が上品に透ける）
+                  if (isExposedRoof) {
+                    outColor = vec4(tCol.rgb, mix(1.0, 0.16, mask));
+                    return;
+                  }
+                  if (mask > 0.45) discard;
+                  outColor = vec4(tCol.rgb, 1.0 - mask * 1.6);
+                  return;
+                } else {
+                  // モード0 (デフォルト): 外表面の「実際の地形段差（崖・尾根の輪郭）」だけを描く
+                  // 1x1 ブロックごとの細かい格子線は描かず、山の外郭シルエットだけが残る！
+                  if (isExposedRoof) {
+                    int roofBz = curBz - 1;
+                    vec2 fxy = fract(vBlockPos);
+                    bool edgeW = fxy.x < 0.16 && ((sampleWaterCell(bxy + ivec2(-1, 0), roofBz).y & 2) == 0);
+                    bool edgeE = fxy.x > 0.84 && ((sampleWaterCell(bxy + ivec2(1, 0), roofBz).y & 2) == 0);
+                    bool edgeN = fxy.y < 0.16 && ((sampleWaterCell(bxy + ivec2(0, -1), roofBz).y & 2) == 0);
+                    bool edgeS = fxy.y > 0.84 && ((sampleWaterCell(bxy + ivec2(0, 1), roofBz).y & 2) == 0);
+                    if (edgeW || edgeE || edgeN || edgeS) {
+                      vec3 contourCol = mix(tCol.rgb * 1.1, vec3(0.65, 0.92, 1.0), 0.55);
+                      outColor = vec4(contourCol, 0.45 * mask + (1.0 - mask));
+                      return;
+                    }
+                    // 窓の外縁（切り抜き境界）に細い淡い縁を残して境目をわかりやすく
+                    if (screenDist > uXrayRadiusPx * 0.92) {
+                      outColor = vec4(tCol.rgb, (1.0 - mask) * 0.7);
+                      return;
+                    }
+                    discard;
+                  }
+                  if (mask > 0.45) discard;
+                  outColor = vec4(tCol.rgb, 1.0 - mask * 1.6);
+                  return;
+                }
+              }
+            }
+
+            // ★ 洞窟内の視認性アップ：プレイヤー周囲の床・壁をほんのり暖色の松明ライトで照らす
+            if (vSliceZ < uPlayerBaseSlice + 14) {
+              vec3 fragWorld = vec3(vBlockPos, float(vSliceZ) / 8.0);
+              float d3 = length(fragWorld - (uPlayerWorldPos + vec3(0.0, 0.0, 0.8)));
+              float torch = clamp(1.0 - d3 / 6.5, 0.0, 1.0);
+              torch = torch * torch * uOcclusionFade;
+              tCol.rgb *= (1.0 + torch * vec3(0.58, 0.46, 0.24));
+            }
+          }
+
           outColor = vec4(tCol.rgb, 1.0);
           return;
         }
@@ -376,6 +463,12 @@
       uTime: gl.getUniformLocation(worldProg, "uTime"),
       uMode: gl.getUniformLocation(worldProg, "uMode"),
       uWireframe: gl.getUniformLocation(worldProg, "uWireframe"),
+      uPlayerScreenPos: gl.getUniformLocation(worldProg, "uPlayerScreenPos"),
+      uPlayerWorldPos: gl.getUniformLocation(worldProg, "uPlayerWorldPos"),
+      uPlayerBaseSlice: gl.getUniformLocation(worldProg, "uPlayerBaseSlice"),
+      uOcclusionFade: gl.getUniformLocation(worldProg, "uOcclusionFade"),
+      uXrayRadiusPx: gl.getUniformLocation(worldProg, "uXrayRadiusPx"),
+      uXrayMode: gl.getUniformLocation(worldProg, "uXrayMode"),
     };
 
     const sLoc = {
@@ -574,6 +667,18 @@
       const playerBaseSlice = Math.round(player.z * BLOCK_SLICES);
       const playerMaxSlice = playerBaseSlice + pSliceCount - 1;
 
+      // プレイヤー胴体中心のスクリーン座標（WebGL gl_FragCoord は左下原点なので Y を反転）
+      const pRelX = (player.x - cam.x) * blockScreenPx;
+      const pRelY = (player.y - cam.y) * blockScreenPx;
+      const pScreenX = centerX + (pRelX * cosYaw - pRelY * sinYaw);
+      const pBodySlice = player.z * BLOCK_SLICES + pSliceCount * 0.52;
+      const pScreenYTopDown =
+        centerY - (pBodySlice - camBaseSlice) * liftPerSlice + (pRelX * sinYaw + pRelY * cosYaw) * squashY;
+      const pFragY = viewH - pScreenYTopDown;
+      const xrayRadiusPx = (settings.xrayRadiusBlocks || 5.0) * blockScreenPx;
+      const occlusionFade = settings.occlusionFade || 0;
+      const xrayMode = settings.xrayMode !== undefined ? settings.xrayMode : 0;
+
       const floorInfo = world.findFloorBelow(player.x, player.y, player.z + 0.05);
       const shadowSliceZ = Math.round(floorInfo.floorZ * BLOCK_SLICES);
 
@@ -663,6 +768,12 @@
         gl.uniform1i(wLoc.uTerrainLayers, terrainLayers);
         gl.uniform1f(wLoc.uTime, timeSec);
         gl.uniform1i(wLoc.uWireframe, settings.showWireframe ? 1 : 0);
+        gl.uniform2f(wLoc.uPlayerScreenPos, pScreenX, pFragY);
+        gl.uniform3f(wLoc.uPlayerWorldPos, player.x, player.y, player.z);
+        gl.uniform1i(wLoc.uPlayerBaseSlice, playerBaseSlice);
+        gl.uniform1f(wLoc.uOcclusionFade, occlusionFade);
+        gl.uniform1f(wLoc.uXrayRadiusPx, xrayRadiusPx);
+        gl.uniform1i(wLoc.uXrayMode, xrayMode);
       }
 
       function useSpriteProgram() {

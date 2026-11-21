@@ -41,7 +41,7 @@
       <div class="canvas-stage">
         <canvas id="world-canvas"></canvas>
         <div class="floating-hint">
-          東へ進むと大トンネル＆オーバーハング岩山 ／ ドラッグで回転・スクロールでズーム
+          東へ進むとスパゲッティ洞窟の入口 ／ 洞窟に入ると遮蔽ブロックが自動で輪郭線・半透明になります
         </div>
       </div>
 
@@ -125,9 +125,27 @@
             <span id="val-water-total" class="mono-val">57600 / 57600 (流動中)</span>
           </div>
           <div class="preset-row">
-            <button id="btn-reflow-water" class="chip-btn chip-accent">💧 高所から流し直す</button>
-            <button id="btn-regen-world" class="chip-btn">🏔 新しい地形を生成</button>
+            <button id="btn-goto-cave" class="chip-btn chip-accent">🕳 洞窟の入口へ移動</button>
+            <button id="btn-reflow-water" class="chip-btn">💧 水を流し直す</button>
+            <button id="btn-regen-world" class="chip-btn">🏔 新しい地形</button>
           </div>
+        </div>
+
+        <div class="control-block">
+          <div class="control-label-row">
+            <span>遮蔽ブロック透視（洞窟・崖裏）</span>
+            <span id="badge-occlusion" class="occlusion-badge">待機中（屋外）</span>
+          </div>
+          <div class="preset-row" style="margin-bottom:6px;">
+            <button class="chip-btn active" data-xray="0">地形輪郭のみ</button>
+            <button class="chip-btn" data-xray="1">うっすら半透明</button>
+            <button class="chip-btn" data-xray="2">完全切り抜き</button>
+          </div>
+          <div class="control-label-row">
+            <label for="slider-xray-radius">透視窓の広さ</label>
+            <span id="val-xray-radius" class="mono-val">5.0 blk</span>
+          </div>
+          <input id="slider-xray-radius" type="range" min="2.5" max="9.0" step="0.5" value="5.0" />
         </div>
 
         <div class="control-block">

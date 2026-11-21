@@ -458,6 +458,23 @@ kbd {
   font-weight: 700;
 }
 
+.occlusion-badge {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text-sub);
+}
+
+.occlusion-badge.active {
+  background: rgba(56, 189, 248, 0.18);
+  border-color: var(--sky-accent);
+  color: var(--sky-accent);
+  font-weight: 700;
+}
+
 input[type="range"] {
   width: 100%;
   accent-color: var(--accent);

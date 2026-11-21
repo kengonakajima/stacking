@@ -27,6 +27,11 @@
     useEdgeHighlight: true,
     pixelated: true,
     showWireframe: false,
+    // 洞窟・遮蔽時の X-Ray 透視設定
+    xrayMode: 0, // 0=輪郭線+半透明, 1=輪郭線のみ, 2=半透明のみ
+    xrayRadiusBlocks: 5.0,
+    occlusionFade: 0,
+    isOccluded: false,
   };
 
   const camera = {
@@ -102,6 +107,10 @@
   const valWaterTotal = document.getElementById("val-water-total");
   const btnReflowWater = document.getElementById("btn-reflow-water");
   const btnRegenWorld = document.getElementById("btn-regen-world");
+  const btnGotoCave = document.getElementById("btn-goto-cave");
+  const sliderXrayRadius = document.getElementById("slider-xray-radius");
+  const valXrayRadius = document.getElementById("val-xray-radius");
+  const badgeOcclusion = document.getElementById("badge-occlusion");
 
   const sliderSpacing = document.getElementById("slider-spacing");
   const valSpacing = document.getElementById("val-spacing");
@@ -131,8 +140,42 @@
     settings.maxVisibleSlice = world.maxUsedSlice;
     sliderCutaway.value = String(world.maxUsedSlice);
     valCutaway.textContent = `${world.maxUsedSlice} / ${world.maxUsedSlice}`;
-    statWorldMeta.textContent = `${world.sizeX}×${world.sizeY}×${world.sizeZ} (${world.solidBlockCount.toLocaleString()} blk / ベイク ${world.initialBakeMs.toFixed(0)}ms)`;
+    statWorldMeta.textContent = `${world.sizeX}×${world.sizeY}×${world.sizeZ} (洞窟 ${world.spaghettiCarvedCount.toLocaleString()} / ベイク ${world.initialBakeMs.toFixed(0)}ms)`;
     updateWaterHud();
+  }
+
+  /**
+   * プレイヤーからカメラ方向への平行投影レイ＋真上天井を判定し、
+   * 洞窟内や崖の裏でプレイヤーがブロックに隠れているか調べる。
+   */
+  function checkPlayerOccluded() {
+    // 1. 真上に屋根があるか（洞窟・トンネル・オーバーハング直下）
+    const pbx = Math.floor(player.x);
+    const pby = Math.floor(player.y);
+    const headBz = Math.floor(player.z + player.height);
+    if (world.skyRoofDistance(pbx, pby, headBz) > 0) {
+      return true;
+    }
+
+    // 2. カメラ方向へのレイマーチ（崖や木の裏に隠れた場合も自動検出）
+    const pitchRad = (camera.pitchDeg * Math.PI) / 180;
+    const cotPitch = Math.cos(pitchRad) / Math.max(0.15, Math.sin(pitchRad));
+    const stepPerZ = cotPitch * settings.sliceSpacingMult;
+    const rayDx = stepPerZ * Math.sin(camera.yaw);
+    const rayDy = stepPerZ * Math.cos(camera.yaw);
+
+    const startZ = player.z + 1.05;
+    const maxDz = world.sizeZ - startZ;
+    for (let dz = 0.55; dz <= maxDz; dz += 0.35) {
+      const rx = Math.floor(player.x + rayDx * dz);
+      const ry = Math.floor(player.y + rayDy * dz);
+      const rz = Math.floor(startZ + dz);
+      if (!world.inBounds(rx, ry, rz)) break;
+      if (world.getBlock(rx, ry, rz) !== BLOCK_AIR) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // ============================================================
@@ -342,7 +385,7 @@
     camera.z += (player.z - camera.z) * Math.min(1, dt * 4.5);
 
     hudPos.textContent = `${player.x.toFixed(1)}, ${player.y.toFixed(1)}, ${player.z.toFixed(1)}`;
-    hudBiome.textContent = world.getBiomeNameAt(player.x, player.y);
+    hudBiome.textContent = world.getBiomeNameAt(player.x, player.y, player.z + 1.0);
     const floor = world.findFloorBelow(player.x, player.y, player.z + 0.05);
     if (player.inWater) {
       hudGround.textContent = `水中 (${player.waterDepth}/8)`;
@@ -351,6 +394,17 @@
     } else {
       hudGround.textContent = "空中";
     }
+
+    // 洞窟・崖裏による遮蔽を判定し、X-Ray 透過フェードを滑らかに補間
+    const occluded = checkPlayerOccluded();
+    settings.isOccluded = occluded;
+    const targetFade = occluded ? 1.0 : 0.0;
+    settings.occlusionFade += (targetFade - settings.occlusionFade) * Math.min(1, dt * 8.5);
+    if (Math.abs(settings.occlusionFade - targetFade) < 0.005) {
+      settings.occlusionFade = targetFade;
+    }
+    badgeOcclusion.textContent = occluded ? "透視ON（遮蔽中）" : "待機中（屋外）";
+    badgeOcclusion.classList.toggle("active", occluded);
   }
 
   // ============================================================
@@ -552,6 +606,30 @@
     updateWaterHud();
   });
   btnRegenWorld.addEventListener("click", regenerateWorld);
+  btnGotoCave.addEventListener("click", () => {
+    player.x = world.caveEntranceX;
+    player.y = world.caveEntranceY;
+    player.z = world.caveEntranceZ;
+    player.vz = 0;
+    player.facing = 0;
+    camera.x = player.x;
+    camera.y = player.y;
+    camera.z = player.z;
+  });
+
+  document.querySelectorAll("[data-xray]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      settings.xrayMode = parseInt(btn.dataset.xray, 10);
+      document.querySelectorAll("[data-xray]").forEach((b) => {
+        b.classList.toggle("active", b === btn);
+      });
+    });
+  });
+
+  sliderXrayRadius.addEventListener("input", () => {
+    settings.xrayRadiusBlocks = parseFloat(sliderXrayRadius.value);
+    valXrayRadius.textContent = `${settings.xrayRadiusBlocks.toFixed(1)} blk`;
+  });
 
   sliderYaw.addEventListener("input", () => {
     const deg = parseFloat(sliderYaw.value);
