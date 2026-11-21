@@ -380,7 +380,9 @@
     const bakeStartMs = performance.now();
 
     function bakeSlices(enableAO, enableEdge) {
+      // WebGL2 TEXTURE_2D_ARRAY へ直接転送できる Uint8Array スライス配列を生成（DOM Canvas 不要で超高速）
       const slices = [];
+      const bounds = [];
 
       function getSideAOInfo(bx, by, bz, nx, ny) {
         if (getBlock(bx + nx, by + ny, bz) !== BLOCK_AIR) return null;
@@ -403,35 +405,35 @@
         const lz = sliceZ % BLOCK_SLICES;
         const isBoundaryPlane = lz === 0 && bz > 0;
 
-        // まずこのスライスに1ブロックでも描く対象があるか事前チェック（空スライスのCanvas生成を回避）
-        let anyInSlice = false;
-        for (let by = 0; by < WORLD_Y && !anyInSlice; by++) {
+        let bMinX = WORLD_X;
+        let bMaxX = -1;
+        let bMinY = WORLD_Y;
+        let bMaxY = -1;
+        for (let by = 0; by < WORLD_Y; by++) {
           for (let bx = 0; bx < WORLD_X; bx++) {
-            if (bz < WORLD_Z && blocks[index(bx, by, bz)] !== BLOCK_AIR) {
-              anyInSlice = true;
-              break;
-            }
-            if (isBoundaryPlane && blocks[index(bx, by, bz - 1)] !== BLOCK_AIR) {
-              anyInSlice = true;
-              break;
+            const hasCur = bz < WORLD_Z && blocks[index(bx, by, bz)] !== BLOCK_AIR;
+            const hasBelow = isBoundaryPlane && blocks[index(bx, by, bz - 1)] !== BLOCK_AIR;
+            if (hasCur || hasBelow) {
+              if (bx < bMinX) bMinX = bx;
+              if (bx > bMaxX) bMaxX = bx;
+              if (by < bMinY) bMinY = by;
+              if (by > bMaxY) bMaxY = by;
             }
           }
         }
-        if (!anyInSlice) {
+        if (bMaxX < bMinX) {
           slices.push(null);
+          bounds.push(null);
           continue;
         }
+        bounds.push({ minX: bMinX, maxX: bMaxX + 1, minY: bMinY, maxY: bMaxY + 1 });
 
-        const c = document.createElement("canvas");
-        c.width = canvasW;
-        c.height = canvasH;
-        const ctx = c.getContext("2d");
-        const img = ctx.createImageData(canvasW, canvasH);
-        const buf32 = new Uint32Array(img.data.buffer);
+        const rawBytes = new Uint8Array(canvasW * canvasH * 4);
+        const buf32 = new Uint32Array(rawBytes.buffer);
 
-        for (let by = 0; by < WORLD_Y; by++) {
+        for (let by = bMinY; by <= bMaxY; by++) {
           const basePy = by * BLOCK_SIZE;
-          for (let bx = 0; bx < WORLD_X; bx++) {
+          for (let bx = bMinX; bx <= bMaxX; bx++) {
             let type = bz < WORLD_Z ? blocks[index(bx, by, bz)] : BLOCK_AIR;
             let drawBz = bz;
             let drawLz = lz;
@@ -598,14 +600,13 @@
           }
         }
 
-        ctx.putImageData(img, 0, 0);
-        slices.push(c);
+        slices.push(rawBytes);
       }
 
-      return slices;
+      return { slices, bounds };
     }
 
-    function getSlices(enableAO, enableEdge) {
+    function getSlicePack(enableAO, enableEdge) {
       const key = `${enableAO ? 1 : 0}_${enableEdge ? 1 : 0}`;
       if (!sliceCache[key]) {
         sliceCache[key] = bakeSlices(enableAO, enableEdge);
@@ -613,7 +614,12 @@
       return sliceCache[key];
     }
 
-    const defaultSlices = getSlices(true, true);
+    function getSlices(enableAO, enableEdge) {
+      return getSlicePack(enableAO, enableEdge).slices;
+    }
+
+    const defaultPack = getSlicePack(true, true);
+    const defaultSlices = defaultPack.slices;
     const initialBakeMs = performance.now() - bakeStartMs;
 
     let maxUsedSlice = 0;
@@ -691,96 +697,40 @@
       }
     }
 
-    const waterBodySlices = new Array(totalSlices);
-    const waterSurfaceMasks = new Array(totalSlices);
-    const waterBodyCtxs = new Array(totalSlices);
-    const waterSurfCtxs = new Array(totalSlices);
-    const waterBodyImgs = new Array(totalSlices);
-    const waterSurfImgs = new Array(totalSlices);
-    const waterSliceHasBody = new Uint8Array(totalSlices);
-    const waterSliceHasSurface = new Uint8Array(totalSlices);
-    const dirtyWaterSlices = new Uint8Array(totalSlices);
+    // WebGL2 3D/Array テクスチャへ直接転送する軽量バイトバッファ（128x128x12 x RG8 = 393KB のみ！）
+    // R = 表示水深 (0..8), G = bit0: 落下中(滝) | bit1: 固体ブロックフラグ（岸辺泡シェーダー用）
+    const waterLayerBytes = new Array(WORLD_Z);
+    const dirtyWaterLayers = new Uint8Array(WORLD_Z);
+    let waterTexVersion = 0;
 
-    for (let s = 0; s < totalSlices; s++) {
-      const bc = document.createElement("canvas");
-      bc.width = WORLD_X;
-      bc.height = WORLD_Y;
-      const bCtx = bc.getContext("2d");
-      waterBodySlices[s] = bc;
-      waterBodyCtxs[s] = bCtx;
-      waterBodyImgs[s] = bCtx.createImageData(WORLD_X, WORLD_Y);
-
-      const sc = document.createElement("canvas");
-      sc.width = WORLD_X;
-      sc.height = WORLD_Y;
-      const sCtx = sc.getContext("2d");
-      waterSurfaceMasks[s] = sc;
-      waterSurfCtxs[s] = sCtx;
-      waterSurfImgs[s] = sCtx.createImageData(WORLD_X, WORLD_Y);
+    for (let z = 0; z < WORLD_Z; z++) {
+      waterLayerBytes[z] = new Uint8Array(WORLD_X * WORLD_Y * 2);
+      dirtyWaterLayers[z] = 1;
     }
 
     function markBlockWaterDirty(bz) {
-      const from = bz * BLOCK_SLICES;
-      const to = Math.min(totalSlices - 1, (bz + 1) * BLOCK_SLICES);
-      for (let s = from; s <= to; s++) {
-        dirtyWaterSlices[s] = 1;
+      if (bz >= 0 && bz < WORLD_Z) {
+        dirtyWaterLayers[bz] = 1;
       }
     }
 
     function rebuildDirtyWaterSlices() {
-      for (let sliceZ = 0; sliceZ < totalSlices; sliceZ++) {
-        if (!dirtyWaterSlices[sliceZ]) continue;
-        dirtyWaterSlices[sliceZ] = 0;
-
-        const bz = Math.floor(sliceZ / BLOCK_SLICES);
-        const lz = sliceZ % BLOCK_SLICES;
-
-        const bBuf = new Uint32Array(waterBodyImgs[sliceZ].data.buffer);
-        const sBuf = new Uint32Array(waterSurfImgs[sliceZ].data.buffer);
-        bBuf.fill(0);
-        sBuf.fill(0);
-
-        let hasBody = 0;
-        let hasSurf = 0;
-
-        for (let y = 0; y < WORLD_Y; y++) {
-          const rowOff = y * WORLD_X;
-          for (let x = 0; x < WORLD_X; x++) {
-            if (bz < WORLD_Z) {
-              const idx = index(x, y, bz);
-              const visLevel = waterToVisualLevel(water[idx]);
-              if (visLevel >= lz + 1) {
-                hasBody = 1;
-                if (falling[idx]) {
-                  bBuf[rowOff + x] = packRGBA(82, 198, 240, 64);
-                } else {
-                  bBuf[rowOff + x] = packRGBA(10, 92, 174, 20);
-                }
-              }
-            }
-
-            if (lz > 0 && bz < WORLD_Z) {
-              const visLevel = waterToVisualLevel(water[index(x, y, bz)]);
-              if (visLevel === lz) {
-                hasSurf = 1;
-                sBuf[rowOff + x] = 0xffffffff;
-              }
-            } else if (lz === 0 && bz > 0) {
-              const belowVis = waterToVisualLevel(water[index(x, y, bz - 1)]);
-              const curVis = bz < WORLD_Z ? waterToVisualLevel(water[index(x, y, bz)]) : 0;
-              const curBlock = bz < WORLD_Z ? blocks[index(x, y, bz)] : BLOCK_AIR;
-              if (belowVis === BLOCK_SLICES && curVis === 0 && curBlock === BLOCK_AIR) {
-                hasSurf = 1;
-                sBuf[rowOff + x] = 0xffffffff;
-              }
-            }
-          }
+      let anyUpdated = false;
+      for (let bz = 0; bz < WORLD_Z; bz++) {
+        if (!dirtyWaterLayers[bz]) continue;
+        const out = waterLayerBytes[bz];
+        const baseIdx = bz * WORLD_Y * WORLD_X;
+        for (let p = 0; p < WORLD_X * WORLD_Y; p++) {
+          const idx = baseIdx + p;
+          const visLevel = waterToVisualLevel(water[idx]);
+          const flags = (falling[idx] ? 1 : 0) | (blocks[idx] !== BLOCK_AIR ? 2 : 0);
+          out[p * 2] = visLevel;
+          out[p * 2 + 1] = flags;
         }
-
-        waterSliceHasBody[sliceZ] = hasBody;
-        waterSliceHasSurface[sliceZ] = hasSurf;
-        if (hasBody) waterBodyCtxs[sliceZ].putImageData(waterBodyImgs[sliceZ], 0, 0);
-        if (hasSurf) waterSurfCtxs[sliceZ].putImageData(waterSurfImgs[sliceZ], 0, 0);
+        anyUpdated = true;
+      }
+      if (anyUpdated) {
+        waterTexVersion++;
       }
     }
 
@@ -792,7 +742,7 @@
       water.fill(0);
       falling.fill(0);
       layerHasWater.fill(0);
-      dirtyWaterSlices.fill(1);
+      dirtyWaterLayers.fill(1);
       waterSettled = false;
       calmStreak = 0;
 
@@ -1034,7 +984,7 @@
       if (calmStreak >= 12) {
         waterSettled = true;
         falling.fill(0);
-        dirtyWaterSlices.fill(1);
+        dirtyWaterLayers.fill(1);
         rebuildDirtyWaterSlices();
       }
 
@@ -1099,10 +1049,10 @@
       findFloorBelow,
       getBiomeNameAt,
       getSlices,
-      waterBodySlices,
-      waterSurfaceMasks,
-      waterSliceHasBody,
-      waterSliceHasSurface,
+      getSlicePack,
+      waterLayerBytes,
+      dirtyWaterLayers,
+      getWaterTexVersion: () => waterTexVersion,
       stepWater,
       resetWaterToHighlands,
       getWaterLevelAt,

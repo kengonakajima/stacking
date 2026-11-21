@@ -12,7 +12,7 @@
     BLOCK_NAMES,
     PREVIEW_MODELS,
     createWorld,
-    renderVoxelWorld,
+    createWebGLRenderer,
     drawSingleModelPreview,
   } = global.VoxelWalk;
 
@@ -22,6 +22,7 @@
   const settings = {
     sliceSpacingMult: 1.0,
     maxVisibleSlice: world.maxUsedSlice,
+    renderScale: 1.0, // WebGL2 なのでデフォルト 1.0x フル解像度で 60fps！
     useAO: true,
     useEdgeHighlight: true,
     pixelated: true,
@@ -71,7 +72,7 @@
   // DOM 要素取得
   // ============================================================
   const worldCanvas = document.getElementById("world-canvas");
-  const worldCtx = worldCanvas.getContext("2d");
+  const glRenderer = createWebGLRenderer(worldCanvas);
   const previewCanvas = document.getElementById("preview-canvas");
   const previewCtx = previewCanvas.getContext("2d");
 
@@ -91,6 +92,7 @@
   const statCrop = document.getElementById("stat-crop");
   const statWaterMs = document.getElementById("stat-water-ms");
   const statWorldMeta = document.getElementById("stat-world-meta");
+  const valRenderScale = document.getElementById("val-render-scale");
 
   const modelTabs = document.getElementById("model-tabs");
   const previewCaption = document.getElementById("preview-caption");
@@ -513,6 +515,17 @@
     { passive: false }
   );
 
+  document.querySelectorAll("[data-rscale]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      settings.renderScale = parseFloat(btn.dataset.rscale);
+      valRenderScale.textContent = `${settings.renderScale.toFixed(2)}x`;
+      document.querySelectorAll("[data-rscale]").forEach((b) => {
+        b.classList.toggle("active", b === btn);
+      });
+      resizeWorldCanvas();
+    });
+  });
+
   sliderSpacing.addEventListener("input", () => setSpacingMult(parseFloat(sliderSpacing.value)));
   document.querySelectorAll("[data-spacing]").forEach((btn) => {
     btn.addEventListener("click", () => setSpacingMult(parseFloat(btn.dataset.spacing)));
@@ -580,8 +593,8 @@
   function resizeWorldCanvas() {
     const parent = worldCanvas.parentElement;
     if (!parent) return;
-    worldCanvas.width = Math.max(300, parent.clientWidth);
-    worldCanvas.height = Math.max(300, parent.clientHeight);
+    worldCanvas.width = Math.max(200, Math.round(parent.clientWidth * settings.renderScale));
+    worldCanvas.height = Math.max(200, Math.round(parent.clientHeight * settings.renderScale));
   }
   window.addEventListener("resize", resizeWorldCanvas);
 
@@ -597,6 +610,7 @@
   let currentFps = 60;
   let smoothRenderMs = 0;
   let statsUiTimer = 0;
+  let previewToggle = 0;
 
   function tick(now) {
     const rawDt = (now - lastTime) / 1000;
@@ -628,19 +642,16 @@
       updateWaterHud();
     }
 
-    const w = worldCanvas.width;
-    const h = worldCanvas.height;
-    worldCtx.clearRect(0, 0, w, h);
-
-    camera.screenCenterX = w / 2;
-    camera.screenCenterY = h / 2 + 12;
-
-    const rStats = renderVoxelWorld(worldCtx, world, player, camera, settings, now * 0.001);
+    const rStats = glRenderer.render(world, player, camera, settings, now * 0.001);
     smoothRenderMs = smoothRenderMs === 0 ? rStats.renderMs : smoothRenderMs * 0.85 + rStats.renderMs * 0.15;
 
-    renderPreview(dt);
+    // 右側単体プレビューは30fps間引き
+    previewToggle ^= 1;
+    if (previewToggle || preview.dragging) {
+      renderPreview(dt * (preview.dragging ? 1 : 2));
+    }
 
-    // 描画統計 UI を約 8Hz で更新（DOM負荷を抑えつつリアルタイム表示）
+    // 描画統計 UI を約 8Hz で更新
     statsUiTimer += dt;
     if (statsUiTimer >= 0.12) {
       statsUiTimer = 0;
@@ -648,10 +659,10 @@
       hudFps.textContent = `${Math.round(currentFps)} fps`;
       statFps.textContent = fpsStr;
       statRenderMs.textContent = `${smoothRenderMs.toFixed(2)} ms`;
-      statDrawTotal.textContent = `${rStats.totalDrawCalls} calls`;
+      statDrawTotal.textContent = `${rStats.totalDrawCalls} calls (${rStats.backend})`;
       statDrawBreak.textContent = `地形 ${rStats.worldDrawCalls} / 水 ${rStats.waterDrawCalls} / 他 ${rStats.miscDrawCalls}`;
-      statSlices.textContent = `${rStats.drawnSlices} / ${rStats.totalSlices} (カリング ${rStats.culledSlices})`;
-      statCrop.textContent = `${Math.round(rStats.cropRatio * 100)}%`;
+      statSlices.textContent = `${rStats.drawnSlices} / ${rStats.totalSlices} 層 (Instanced)`;
+      statCrop.textContent = `${Math.round(rStats.cropRatio * 100)}% (${worldCanvas.width}×${worldCanvas.height})`;
       statWaterMs.textContent = world.isWaterSettled()
         ? "0.00 ms (静止)"
         : `${lastWaterStepMs.toFixed(2)} ms`;

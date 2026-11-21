@@ -12,7 +12,7 @@
     <main class="viewport-pane">
       <header class="hud-bar">
         <div class="hud-left">
-          <h1 class="app-title">VOXEL WALK <span class="badge">128×128</span></h1>
+          <h1 class="app-title">VOXEL WALK <span class="badge">WebGL2 · 128×128</span></h1>
           <div class="stat-group">
             <div class="stat">
               <span class="stat-label">FPS</span>
@@ -97,6 +97,17 @@
           <div class="perf-row">
             <span>ワールド規模</span>
             <span id="stat-world-meta" class="mono-sub">128×128×12</span>
+          </div>
+        </div>
+        <div class="control-block" style="margin-top:8px; margin-bottom:0;">
+          <div class="control-label-row">
+            <span>描画解像度（WebGL2 内部解像度）</span>
+            <span id="val-render-scale" class="mono-val">1.00x</span>
+          </div>
+          <div class="preset-row">
+            <button class="chip-btn" data-rscale="0.5">0.5x (ドット調)</button>
+            <button class="chip-btn" data-rscale="0.75">0.75x</button>
+            <button class="chip-btn active" data-rscale="1">1.0x (高精細)</button>
           </div>
         </div>
       </section>

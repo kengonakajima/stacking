@@ -588,16 +588,21 @@
     ];
   }
 
-  function buildPlayerPose(stepPose) {
+  /**
+   * プレイヤー各ポーズの生 RGBA ピクセルデータ配列（WebGL2 TEXTURE_2D_ARRAY 転送用）も返す
+   */
+  function buildPlayerPoseData(stepPose) {
     const sliceDefs = makePlayerSliceDefs(stepPose);
     const size = 8;
     const canvases = [];
+    const rawSlices = [];
 
     for (let z = 0; z < sliceDefs.length; z++) {
       const c = document.createElement("canvas");
       c.width = size;
       c.height = size;
       const ctx = c.getContext("2d");
+      const raw = new Uint8Array(size * size * 4);
       const rows = sliceDefs[z];
       const shade = 0.82 + (z / (sliceDefs.length - 1)) * 0.22;
 
@@ -607,20 +612,37 @@
           if (!hex) continue;
           const num = parseInt(hex.slice(1), 16);
           const abgr = shadeAndPackABGR((num >> 16) & 255, (num >> 8) & 255, num & 255, shade);
-          ctx.fillStyle = `rgb(${abgr & 255},${(abgr >>> 8) & 255},${(abgr >>> 16) & 255})`;
+          const r = abgr & 255;
+          const g = (abgr >>> 8) & 255;
+          const b = (abgr >>> 16) & 255;
+          ctx.fillStyle = `rgb(${r},${g},${b})`;
           ctx.fillRect(x, y, 1, 1);
+
+          const idx = (y * size + x) * 4;
+          raw[idx] = r;
+          raw[idx + 1] = g;
+          raw[idx + 2] = b;
+          raw[idx + 3] = 255;
         }
       }
       canvases.push(c);
+      rawSlices.push(raw);
     }
 
-    return canvases;
+    return { canvases, rawSlices };
   }
 
+  const poseIdle = buildPlayerPoseData(0);
+  const poseStepA = buildPlayerPoseData(1);
+  const poseStepB = buildPlayerPoseData(-1);
+
   const playerPoses = {
-    idle: buildPlayerPose(0),
-    stepA: buildPlayerPose(1),
-    stepB: buildPlayerPose(-1),
+    idle: poseIdle.canvases,
+    stepA: poseStepA.canvases,
+    stepB: poseStepB.canvases,
+    rawIdle: poseIdle.rawSlices,
+    rawStepA: poseStepA.rawSlices,
+    rawStepB: poseStepB.rawSlices,
   };
 
   const previewModels = {
