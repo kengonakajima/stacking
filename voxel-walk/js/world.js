@@ -108,6 +108,7 @@
     const water = new Uint8Array(cellCount);
     const falling = new Uint8Array(cellCount);
     const torches = new Uint8Array(cellCount); // 1 = 松明が置かれている（明るさ15）
+    const foliage = new Uint8Array(cellCount); // 0=なし, 1=短い雑草, 2=背の高い雑草, 3=花
     const skyLight = new Uint8Array(cellCount); // 0..15（太陽光）
     const blockLight = new Uint8Array(cellCount); // 0..15（松明・溶岩の光、15ブロック＝半径16マス伝播）
     const surfaceHeight = new Uint8Array(WORLD_X * WORLD_Y);
@@ -1184,6 +1185,7 @@
       const i = index(bx, by, bz);
       if (blocks[i] !== BLOCK_AIR || torches[i]) return false;
       torches[i] = 1;
+      foliage[i] = 0;
       torchCount++;
       markBlockWaterDirty(bz);
       rebuildDirtyWaterSlices();
@@ -1234,7 +1236,7 @@
         for (let p = 0; p < WORLD_X * WORLD_Y; p++) {
           const idx = baseIdx + p;
           const visLevel = waterToVisualLevel(water[idx]);
-          // Gチャンネルフラグ: bit0=滝落下, bit1=固体, bit2=溶岩, bit3=松明, bit4=木(幹/葉), bit5=葉
+          // Gチャンネルフラグ: bit0=滝落下, bit1=固体, bit2=溶岩, bit3=松明, bit4=木(幹/葉), bit5=葉, bit6-7=草花(1=短草,2=高草,3=花)
           const b = blocks[idx];
           const flags =
             (falling[idx] ? 1 : 0) |
@@ -1242,7 +1244,8 @@
             (b === BLOCK_LAVA ? 4 : 0) |
             (torches[idx] ? 8 : 0) |
             (b === BLOCK_WOOD || b === BLOCK_LEAVES ? 16 : 0) |
-            (b === BLOCK_LEAVES ? 32 : 0);
+            (b === BLOCK_LEAVES ? 32 : 0) |
+            ((foliage[idx] & 3) << 6);
           out[p * 2] = visLevel;
           out[p * 2 + 1] = flags;
         }
@@ -1551,6 +1554,39 @@
     torches[index(62, 64, spawnZ)] = 1;
     torches[index(67, 64, 5)] = 1;
     torchCount = 2;
+
+    // 草ブロックの上に自然な群生で雑草・野花を配置（歩ける装飾レイヤー）
+    let foliageCount = 0;
+    let flowerCount = 0;
+    for (let y = 1; y < WORLD_Y - 1; y++) {
+      for (let x = 1; x < WORLD_X - 1; x++) {
+        const topZ = surfaceHeight[y * WORLD_X + x];
+        const z = topZ + 1;
+        if (z >= WORLD_Z) continue;
+        if (getBlock(x, y, topZ) !== BLOCK_GRASS) continue;
+        const i = index(x, y, z);
+        if (blocks[i] !== BLOCK_AIR || torches[i] || water[i] > 0) continue;
+        // プレイヤーの初期スポーン地点直下だけ空ける
+        if (x === 60 && y === 64) continue;
+
+        const patch = fbm2D(x * 0.13 + 3.7, y * 0.13 + 9.2, seed + 4101);
+        const flowerPatch = fbm2D(x * 0.16 + 19.4, y * 0.16 + 5.1, seed + 4201);
+        const r = hash3(x, y, seed + 4444);
+
+        if (flowerPatch > 0.62 && r > 0.87) {
+          foliage[i] = 3; // 花（赤・黄・白・青・ピンク：草むらの中に約1/3の控えめな割合で点在）
+          flowerCount++;
+          foliageCount++;
+        } else if (patch > 0.44 && r > 0.54) {
+          foliage[i] = r > 0.76 ? 2 : 1; // 2=背の高い雑草, 1=短い雑草
+          foliageCount++;
+        } else if (r > 0.86) {
+          foliage[i] = 1; // 草原に点在する小さな草むら
+          foliageCount++;
+        }
+      }
+    }
+
     dirtyWaterLayers.fill(1);
     rebuildDirtyWaterSlices();
     recomputeSkyLight();
@@ -1573,6 +1609,8 @@
       caveEntranceY: 64.0,
       caveEntranceZ: 5.0,
       treeCount: treePositions.length,
+      foliageCount,
+      flowerCount,
       lavaPoolCount: lavaPools.length,
       solidBlockCount,
       spaghettiCarvedCount,

@@ -62,7 +62,7 @@
     precision highp sampler3D;
 
     uniform sampler2DArray uTerrainTex; // 768x768 x N slices (RGBA8)
-    uniform sampler2DArray uWaterTex;   // 128x128 x 14 layers (RG8: R=visLevel 0..8, G=flags: 1=fall, 2=solid, 4=lava, 8=torch, 16=tree, 32=leaves)
+    uniform sampler2DArray uWaterTex;   // 128x128 x 14 layers (RG8: R=visLevel 0..8, G=flags: 1=fall, 2=solid, 4=lava, 8=torch, 16=tree, 32=leaves, 64-128=foliage)
     uniform sampler3D uLightTex;        // 128x128 x 14 (RG8, LINEAR: R=blockLight, G=skyLight)
     uniform sampler2D uTreeSwayTex;     // 128x128 (RGBA8, NEAREST: RG=swayXY, B=(baseBz<<4)|heightBlocks, A=hitEnergy)
     uniform vec2 uYawCS;                // 隣接する葉ブロック重なり時の前後ソート用
@@ -418,6 +418,138 @@
             vec3 flameCol = dFlame < rMax * 0.55 ? vec3(1.0, 0.96, 0.65) : vec3(1.0, 0.56, 0.12);
             outColor = vec4(flameCol, 1.0);
             return;
+          }
+        }
+      }
+
+      // 2.5 草ブロック上の揺れる雑草・野花の 3D スプライトスタッキング描画
+      int foliageType = (flags >> 6) & 3;
+      if (foliageType > 0 && !isTorch && visLevel == 0 && bz < uWorldZ && lz <= 6) {
+        // 透視モードで丘を切り抜いている範囲の草花は宙に浮かないよう非表示にする
+        bool culledByXray = false;
+        if (uOcclusionFade > 0.25) {
+          float sDist = length(gl_FragCoord.xy - uPlayerScreenPos);
+          int cutSl = (sDist < uBlockPx * 1.35) ? (uPlayerBaseSlice + 4) : (uPlayerBaseSlice + 12);
+          if (vSliceZ >= cutSl && sDist < uXrayRadiusPx * 0.92) {
+            culledByXray = true;
+          }
+        }
+
+        if (!culledByXray) {
+          vec2 fxy = fract(vBlockPos);
+          vec2 cellSeed = hash22(vec2(bxy) + vec2(13.7, 29.3));
+
+          // 草原を吹き抜ける風波（画面横〜斜め方向メイン）＋プレイヤー通過時の押し分け
+          float windWave = sin(uTime * 2.5 + float(bxy.x) * 0.30 - float(bxy.y) * 0.24 + cellSeed.x * 6.28318);
+          float windCross = cos(uTime * 1.9 + float(bxy.x) * 0.18 + float(bxy.y) * 0.27 + cellSeed.y * 6.28318);
+          vec2 baseWind = vec2(windWave * 0.12 + windCross * 0.045, -windWave * 0.09 + windCross * 0.045);
+
+          vec2 toPlant = (vec2(bxy) + 0.5) - uPlayerWorldPos.xy;
+          float pDist = length(toPlant);
+          vec2 playerPush = vec2(0.0);
+          if (pDist < 1.15 && pDist > 0.01 && abs(float(bz) - uPlayerWorldPos.z) < 1.2) {
+            float st = 1.0 - pDist / 1.15;
+            playerPush = (toPlant / pDist) * (st * st * 0.26);
+          }
+
+          // 花（foliageType == 3）：濃い緑の茎＋先端に形を崩さない可愛いピクセル花冠（5色）
+          if (foliageType == 3) {
+            int flowerNum = (cellSeed.x > 0.65) ? 2 : 1;
+            for (int f = 0; f < 2; f++) {
+              if (f >= flowerNum) break;
+              vec2 fh = hash22(vec2(bxy) + vec2(float(f) * 41.3 + 5.1, float(f) * 17.9 + 2.3));
+              vec2 stemBase = vec2(0.28 + fh.x * 0.44, 0.28 + fh.y * 0.44);
+              int hStem = (f == 0) ? (fh.x > 0.45 ? 4 : 3) : 2;
+              if (lz > hStem + 1) continue;
+
+              float fAng = fh.y * 6.2831853;
+              vec2 fDir = vec2(cos(fAng), sin(fAng));
+              vec2 flowerSway = baseWind + fDir * (sin(uTime * (2.2 + fh.x) + fAng) * 0.055) + playerPush;
+
+              if (lz < hStem) {
+                float b = float(lz) / 4.0;
+                vec2 stemPos = stemBase + flowerSway * (b * b);
+                vec2 d = abs(fxy - stemPos);
+                if (max(d.x, d.y) < 0.082) {
+                  vec3 stemCol = mix(vec3(0.07, 0.24, 0.09), vec3(0.16, 0.48, 0.16), b);
+                  outColor = vec4(stemCol * evalWorldLight(vBlockPos, vSliceZ), 1.0);
+                  return;
+                }
+              } else {
+                // 花冠（2スライス同じオフセットで立方体/ピクセル花の形をキープ）
+                float tipB = float(hStem) / 4.0;
+                vec2 headPos = stemBase + flowerSway * (tipB * tipB);
+                vec2 d = abs(fxy - headPos);
+                bool isCenter = max(d.x, d.y) < 0.072;
+                bool isPetal = (lz == hStem)
+                  ? ((d.x < 0.175 && d.y < 0.078) || (d.y < 0.175 && d.x < 0.078))
+                  : (max(d.x, d.y) < 0.12);
+
+                if (isCenter || isPetal) {
+                  int colIdx = int(floor(hash22(vec2(bxy) + float(f) * 9.7).x * 5.0));
+                  vec3 petalCol = vec3(0.95, 0.24, 0.20); // 赤ポピー
+                  vec3 centerCol = vec3(0.22, 0.12, 0.08);
+                  if (colIdx == 1) {
+                    petalCol = vec3(0.99, 0.86, 0.18); // 黄タンポポ
+                    centerCol = vec3(0.92, 0.54, 0.08);
+                  } else if (colIdx == 2) {
+                    petalCol = vec3(0.96, 0.97, 0.99); // 白デイジー
+                    centerCol = vec3(0.98, 0.80, 0.14);
+                  } else if (colIdx == 3) {
+                    petalCol = vec3(0.32, 0.64, 0.99); // 青ヤグルマギク
+                    centerCol = vec3(0.86, 0.95, 1.0);
+                  } else if (colIdx == 4) {
+                    petalCol = vec3(0.98, 0.46, 0.74); // ピンク花
+                    centerCol = vec3(1.0, 0.92, 0.45);
+                  }
+                  vec3 flCol = isCenter ? centerCol : (lz > hStem ? petalCol * 1.06 : petalCol * 0.94);
+                  outColor = vec4(flCol * evalWorldLight(vBlockPos, vSliceZ), 1.0);
+                  return;
+                }
+              }
+            }
+          }
+
+          // 雑草の株（地面の草ブロックと明確にコントラストを付けた深い緑の根元＋明るい穂先！）
+          int bladeCount = (foliageType == 3) ? 2 : 5;
+          vec2 clumpCenter = vec2(0.32 + cellSeed.x * 0.36, 0.32 + cellSeed.y * 0.36);
+          for (int i = 0; i < 5; i++) {
+            if (i >= bladeCount) break;
+            vec2 bh = hash22(vec2(bxy) + vec2(float(i) * 23.1 + 7.3, float(i) * 31.7 + 11.9));
+            int maxLz = (foliageType == 2)
+              ? (4 + int(floor(bh.x * 2.5)))   // 背の高い雑草: 4..6 スライス（存在感しっかり）
+              : ((foliageType == 1)
+                  ? (2 + int(floor(bh.x * 2.4))) // 短い雑草: 2..4 スライス
+                  : (1 + int(floor(bh.x * 2.0)))); // 花の足元: 1..3 スライス
+            if (lz > maxLz) continue;
+
+            // 株の中心から放射状に広がるシルエットで「草の束」としてハッキリ視認できるようにする
+            float fanAng = (float(i) * 1.2566) + bh.x * 0.75;
+            vec2 fanDir = vec2(cos(fanAng), sin(fanAng));
+            vec2 basePos = clamp(clumpCenter + fanDir * (0.07 + bh.y * 0.11), vec2(0.18), vec2(0.82));
+
+            float bAng = bh.y * 6.2831853;
+            vec2 bDir = vec2(cos(bAng), sin(bAng));
+            float hFrac = float(lz) / 5.0;
+            vec2 bladeSway = baseWind + bDir * (sin(uTime * (2.3 + bh.x * 1.4) + bAng) * 0.065) + playerPush;
+            vec2 pos = basePos + fanDir * (0.14 * hFrac) + bladeSway * (hFrac * hFrac);
+            vec2 d = abs(fxy - pos);
+
+            // 太めのボクセル葉幅（根元はしっかり太く、穂先へ細く）
+            float tipRatio = float(lz) / max(1.0, float(maxLz));
+            float halfW = mix(0.118, 0.082, tipRatio);
+            if (max(d.x, d.y) < halfW) {
+              // 根元は地面よりぐっと暗い深緑シャドウ、中段は濃い青緑、穂先は鮮やかな若草ハイライト！
+              vec3 rootCol = vec3(0.06, 0.22, 0.09);
+              vec3 midCol = vec3(0.13, 0.44, 0.16);
+              vec3 tipCol = (cellSeed.y > 0.5) ? vec3(0.68, 0.96, 0.28) : vec3(0.42, 0.86, 0.30);
+              vec3 grassCol = (tipRatio < 0.55)
+                ? mix(rootCol, midCol, tipRatio / 0.55)
+                : mix(midCol, tipCol, (tipRatio - 0.55) / 0.45);
+              grassCol *= (0.90 + 0.18 * bh.y);
+              outColor = vec4(grassCol * evalWorldLight(vBlockPos, vSliceZ), 1.0);
+              return;
+            }
           }
         }
       }

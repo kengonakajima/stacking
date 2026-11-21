@@ -293,25 +293,24 @@
     const maxSlice = Math.min(world.maxUsedSlice, settings.maxVisibleSlice);
 
     // 画面右方向のオフセット（左右の肩のサンプル位置）
-    const rightX = cosYaw * 0.18;
-    const rightY = -sinYaw * 0.18;
+    const rightX = cosYaw * 0.22;
+    const rightY = -sinYaw * 0.22;
 
-    // 頭・胴体・左右の肩の4点をカメラ視線レイで検査し、2点以上遮蔽されていれば実際に隠れていると判定
-    let hits = 0;
+    // 頭・胴体・足元・左肩・右肩の5点すべてがカメラ視線から遮蔽されている（＝完全に隠れた）ときだけ透視ON
     const samples = [
       [player.x, player.y, baseSlice + 10], // 頭・顔
       [player.x, player.y, baseSlice + 6], // 胴体中央
+      [player.x, player.y, baseSlice + 2], // 下半身・足元
       [player.x - rightX, player.y - rightY, baseSlice + 8], // 左肩
       [player.x + rightX, player.y + rightY, baseSlice + 8], // 右肩
     ];
     for (let i = 0; i < samples.length; i++) {
       const sp = samples[i];
-      if (isPointOccludedFromCamera(sp[0], sp[1], sp[2], rayDx, rayDy, maxSlice)) {
-        hits++;
-        if (hits >= 2) return true;
+      if (!isPointOccludedFromCamera(sp[0], sp[1], sp[2], rayDx, rayDy, maxSlice)) {
+        return false;
       }
     }
-    return false;
+    return true;
   }
 
   // ============================================================
