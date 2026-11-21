@@ -109,12 +109,19 @@
   const chkPixelated = document.getElementById("chk-pixelated");
   const chkWireframe = document.getElementById("chk-wireframe");
 
+  function updateWaterHud() {
+    const cur = world.computeCurrentTotalWater();
+    const init = world.getInitialTotalWater();
+    const status = world.isWaterSettled() ? "静止" : "流動中";
+    valWaterTotal.textContent = `${cur} / ${init} (${status})`;
+  }
+
   function syncWorldSliderBounds() {
     sliderCutaway.max = String(world.maxUsedSlice);
     settings.maxVisibleSlice = world.maxUsedSlice;
     sliderCutaway.value = String(world.maxUsedSlice);
     valCutaway.textContent = `${world.maxUsedSlice} / ${world.maxUsedSlice}`;
-    valWaterTotal.textContent = `${world.computeCurrentTotalWater()} / ${world.getInitialTotalWater()} (一定)`;
+    updateWaterHud();
   }
 
   // ============================================================
@@ -523,7 +530,7 @@
 
   btnReflowWater.addEventListener("click", () => {
     world.resetWaterToHighlands();
-    valWaterTotal.textContent = `${world.computeCurrentTotalWater()} / ${world.getInitialTotalWater()} (一定)`;
+    updateWaterHud();
   });
   btnRegenWorld.addEventListener("click", regenerateWorld);
 
@@ -585,15 +592,15 @@
 
     updatePlayer(dt);
 
-    // テラリア式・総量保存の水流ステップ実行
+    // テラリア式・内部64段階・スリープ付き水流ステップ実行
     waterAccum += dt;
-    if (waterAccum >= 0.095) {
+    if (waterAccum >= 0.085) {
       waterAccum = 0;
       const moved = world.stepWater();
       hudWaterAccum++;
-      if (moved || hudWaterAccum >= 10) {
+      if (moved || hudWaterAccum >= 8) {
         hudWaterAccum = 0;
-        valWaterTotal.textContent = `${world.computeCurrentTotalWater()} / ${world.getInitialTotalWater()} (一定)`;
+        updateWaterHud();
       }
     }
 

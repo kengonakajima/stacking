@@ -30,6 +30,15 @@
   const WORLD_Y = 64;
   const WORLD_Z = 10; // 地形は z=0..5、木が z=6..9 まで伸びる
 
+  // テラリア式に内部水量を細かく保持（1ブロック = 64単位、表示は 8段階 = 8単位ごと）
+  const WATER_PER_LEVEL = 8;
+  const WATER_MAX = BLOCK_SLICES * WATER_PER_LEVEL; // 64
+
+  function waterToVisualLevel(units) {
+    if (units <= 0) return 0;
+    return Math.min(BLOCK_SLICES, Math.ceil(units / WATER_PER_LEVEL));
+  }
+
   // スムーズな 2D 値ノイズ（多オクターブ FBM 用）
   function valueNoise2D(x, y, seed) {
     const ix = Math.floor(x);
@@ -456,64 +465,70 @@
     }
 
     // ============================================================
-    // 4. テラリア式・総量保存の8段階水流シミュレーション & 64x64水スライス
+    // 4. テラリア式・内部64段階 / 表示8段階・動的落ち口BFS・スリープ付き水流
     // ============================================================
-    // 各高さ z ごとに「下の段 (z-1) へ落ちられる崖・穴までの最短距離」を BFS で事前計算。
-    // これにより、高い平地に薄く残った水(1/8)も壁や木を回り込みながら
-    // 低い場所を探し回って完全に流れ落ち、高い地面の上に水が残らなくなる。
+    // 各高さ z で「現在まだ満水でない (water < WATER_MAX) 落ち口」までの最短距離を動的 BFS で計算。
+    // 下の池が満水になると落ち口が消えて distToDrop=255 になるため、岸辺での往復振動が起きない。
     const distToDrop = new Uint8Array(cellCount);
     distToDrop.fill(255);
     const bfsQueue = new Int32Array(WORLD_X * WORLD_Y);
+    const layerHasWater = new Uint8Array(WORLD_Z);
 
-    for (let z = 1; z < WORLD_Z; z++) {
-      let qHead = 0;
-      let qTail = 0;
+    function recomputeActiveDrops() {
+      distToDrop.fill(255);
+      for (let z = 1; z < WORLD_Z; z++) {
+        if (!layerHasWater[z]) continue;
+        let qHead = 0;
+        let qTail = 0;
 
-      // まず直下 (z-1) が空洞のセルを距離 0（落ち口）としてキューへ登録
-      for (let y = 0; y < WORLD_Y; y++) {
-        for (let x = 0; x < WORLD_X; x++) {
-          const i = index(x, y, z);
-          if (blocks[i] === BLOCK_AIR && blocks[index(x, y, z - 1)] === BLOCK_AIR) {
-            distToDrop[i] = 0;
-            bfsQueue[qTail++] = y * WORLD_X + x;
+        // 直下 (z - 1) が非固体 かつ まだ満水でない (water < WATER_MAX) セルだけを有効落ち口(距離0)にする
+        for (let y = 0; y < WORLD_Y; y++) {
+          for (let x = 0; x < WORLD_X; x++) {
+            const i = index(x, y, z);
+            if (blocks[i] === BLOCK_AIR) {
+              const below = index(x, y, z - 1);
+              if (blocks[below] === BLOCK_AIR && water[below] < WATER_MAX) {
+                distToDrop[i] = 0;
+                bfsQueue[qTail++] = y * WORLD_X + x;
+              }
+            }
           }
         }
-      }
 
-      // 4近傍 BFS で平地から落ち口までの最短歩数を伝播
-      while (qHead < qTail) {
-        const xy = bfsQueue[qHead++];
-        const cx = xy % WORLD_X;
-        const cy = (xy - cx) / WORLD_X;
-        const nextDist = distToDrop[index(cx, cy, z)] + 1;
-        if (nextDist >= 254) continue;
+        while (qHead < qTail) {
+          const xy = bfsQueue[qHead++];
+          const cx = xy % WORLD_X;
+          const cy = (xy - cx) / WORLD_X;
+          const nextDist = distToDrop[index(cx, cy, z)] + 1;
+          if (nextDist >= 254) continue;
 
-        if (cx + 1 < WORLD_X) {
-          const ni = index(cx + 1, cy, z);
-          if (blocks[ni] === BLOCK_AIR && distToDrop[ni] === 255) {
-            distToDrop[ni] = nextDist;
-            bfsQueue[qTail++] = xy + 1;
+          if (cx + 1 < WORLD_X) {
+            const ni = index(cx + 1, cy, z);
+            if (blocks[ni] === BLOCK_AIR && distToDrop[ni] === 255) {
+              distToDrop[ni] = nextDist;
+              bfsQueue[qTail++] = xy + 1;
+            }
           }
-        }
-        if (cx - 1 >= 0) {
-          const ni = index(cx - 1, cy, z);
-          if (blocks[ni] === BLOCK_AIR && distToDrop[ni] === 255) {
-            distToDrop[ni] = nextDist;
-            bfsQueue[qTail++] = xy - 1;
+          if (cx - 1 >= 0) {
+            const ni = index(cx - 1, cy, z);
+            if (blocks[ni] === BLOCK_AIR && distToDrop[ni] === 255) {
+              distToDrop[ni] = nextDist;
+              bfsQueue[qTail++] = xy - 1;
+            }
           }
-        }
-        if (cy + 1 < WORLD_Y) {
-          const ni = index(cx, cy + 1, z);
-          if (blocks[ni] === BLOCK_AIR && distToDrop[ni] === 255) {
-            distToDrop[ni] = nextDist;
-            bfsQueue[qTail++] = xy + WORLD_X;
+          if (cy + 1 < WORLD_Y) {
+            const ni = index(cx, cy + 1, z);
+            if (blocks[ni] === BLOCK_AIR && distToDrop[ni] === 255) {
+              distToDrop[ni] = nextDist;
+              bfsQueue[qTail++] = xy + WORLD_X;
+            }
           }
-        }
-        if (cy - 1 >= 0) {
-          const ni = index(cx, cy - 1, z);
-          if (blocks[ni] === BLOCK_AIR && distToDrop[ni] === 255) {
-            distToDrop[ni] = nextDist;
-            bfsQueue[qTail++] = xy - WORLD_X;
+          if (cy - 1 >= 0) {
+            const ni = index(cx, cy - 1, z);
+            if (blocks[ni] === BLOCK_AIR && distToDrop[ni] === 255) {
+              distToDrop[ni] = nextDist;
+              bfsQueue[qTail++] = xy - WORLD_X;
+            }
           }
         }
       }
@@ -574,11 +589,11 @@
         for (let y = 0; y < WORLD_Y; y++) {
           const rowOff = y * WORLD_X;
           for (let x = 0; x < WORLD_X; x++) {
-            // 1. 水の体積スライス（bz のセルに lz + 1 以上の水が入っているか）
+            // 1. 水の体積スライス（内部水量 0..64 を表示 8段階 0..8 へ変換）
             if (bz < WORLD_Z) {
               const idx = index(x, y, bz);
-              const w = water[idx];
-              if (w >= lz + 1) {
+              const visLevel = waterToVisualLevel(water[idx]);
+              if (visLevel >= lz + 1) {
                 hasBody = 1;
                 if (falling[idx]) {
                   // 滝（落下中）は泡立った明るいシアン
@@ -590,21 +605,18 @@
               }
             }
 
-            // 2. 露出水面キャップ（この高さ sliceZ がちょうど水面の頂上になっているか）
-            // ケースA: ブロック内水面 (lz = 1..7) -> bz の水量がちょうど lz
+            // 2. 露出水面キャップ（表示深さ visLevel の頂上スライスに水面波紋を描く）
             if (lz > 0 && bz < WORLD_Z) {
-              const w = water[index(x, y, bz)];
-              if (w === lz) {
+              const visLevel = waterToVisualLevel(water[index(x, y, bz)]);
+              if (visLevel === lz) {
                 hasSurf = 1;
                 sBuf[rowOff + x] = 0xffffffff;
               }
-            }
-            // ケースB: ブロック境界水面 (lz = 0, bz > 0) -> 下の段 (bz - 1) が満タン (8) かつ 上の段 (bz) に水がない
-            else if (lz === 0 && bz > 0) {
-              const belowW = water[index(x, y, bz - 1)];
-              const curW = bz < WORLD_Z ? water[index(x, y, bz)] : 0;
+            } else if (lz === 0 && bz > 0) {
+              const belowVis = waterToVisualLevel(water[index(x, y, bz - 1)]);
+              const curVis = bz < WORLD_Z ? waterToVisualLevel(water[index(x, y, bz)]) : 0;
               const curBlock = bz < WORLD_Z ? blocks[index(x, y, bz)] : BLOCK_AIR;
-              if (belowW === BLOCK_SLICES && curW === 0 && curBlock === BLOCK_AIR) {
+              if (belowVis === BLOCK_SLICES && curVis === 0 && curBlock === BLOCK_AIR) {
                 hasSurf = 1;
                 sBuf[rowOff + x] = 0xffffffff;
               }
@@ -620,6 +632,8 @@
     }
 
     let totalWaterUnits = 0;
+    let waterSettled = false;
+    let calmStreak = 0;
 
     /**
      * 山頂・高所の複数の水源に一定量の水をまとめて配置する（常に一定の総量でスタート）
@@ -627,9 +641,11 @@
     function resetWaterToHighlands() {
       water.fill(0);
       falling.fill(0);
+      layerHasWater.fill(0);
       dirtyWaterSlices.fill(1);
+      waterSettled = false;
+      calmStreak = 0;
 
-      // 標高が高い場所（topZ >= 4）を見つけて水源として水を溜める
       const highSpots = [];
       for (let y = 3; y < WORLD_Y - 3; y++) {
         for (let x = 3; x < WORLD_X - 3; x++) {
@@ -640,11 +656,10 @@
         }
       }
 
-      // 目標の総水量（64x64の低い谷に綺麗な池ができる程度のボリューム）
-      const targetUnits = 3400;
+      // 目標の総水量（内部64単位 × 425ブロック相当 = 27200単位）
+      const targetUnits = 3400 * WATER_PER_LEVEL;
       let placed = 0;
 
-      // 高所の複数エリアから滝のように流れ下るように均等配置
       if (highSpots.length > 0) {
         const stride = Math.max(1, Math.floor(highSpots.length / 420));
         let pass = 0;
@@ -653,9 +668,10 @@
             const sp = highSpots[(k + pass * 7) % highSpots.length];
             const z = Math.min(WORLD_Z - 1, sp.z + Math.floor(pass / 4));
             const i = index(sp.x, sp.y, z);
-            if (blocks[i] === BLOCK_AIR && water[i] < BLOCK_SLICES) {
-              const add = Math.min(BLOCK_SLICES - water[i], targetUnits - placed, 4);
+            if (blocks[i] === BLOCK_AIR && water[i] < WATER_MAX) {
+              const add = Math.min(WATER_MAX - water[i], targetUnits - placed, 32);
               water[i] += add;
+              layerHasWater[z] = 1;
               placed += add;
             }
           }
@@ -663,16 +679,16 @@
         }
       }
 
-      // もし高所が少なかった場合は中腹にも補完
       if (placed < targetUnits) {
         for (let y = 4; y < WORLD_Y - 4 && placed < targetUnits; y += 2) {
           for (let x = 4; x < WORLD_X - 4 && placed < targetUnits; x += 2) {
             const z = surfaceHeight[y * WORLD_X + x] + 1;
             if (z < WORLD_Z) {
               const i = index(x, y, z);
-              if (blocks[i] === BLOCK_AIR && water[i] < BLOCK_SLICES) {
-                const add = Math.min(BLOCK_SLICES - water[i], targetUnits - placed);
+              if (blocks[i] === BLOCK_AIR && water[i] < WATER_MAX) {
+                const add = Math.min(WATER_MAX - water[i], targetUnits - placed);
                 water[i] += add;
+                layerHasWater[z] = 1;
                 placed += add;
               }
             }
@@ -681,10 +697,10 @@
       }
 
       totalWaterUnits = placed;
+      recomputeActiveDrops();
       rebuildDirtyWaterSlices();
     }
 
-    // 4方向の隣接オフセット（ステップごとに順番を回して偏りをなくす）
     const DIRS = [
       [1, 0],
       [-1, 0],
@@ -694,11 +710,17 @@
     let simTick = 0;
 
     /**
-     * 水シミュレーションを1ステップ進める（厳密な総量保存）
+     * 水シミュレーションを1ステップ進める（内部64段階・厳密総量保存・動的落ち口BFS・スリープ対応）
      */
     function stepWater() {
+      if (waterSettled) return false;
       simTick++;
       falling.fill(0);
+
+      // 3ステップごとに「まだ満水でない有効落ち口」BFSを再計算（満水になった池の岸での往復を完全防止）
+      if (simTick % 3 === 1) {
+        recomputeActiveDrops();
+      }
 
       const xStart = simTick & 1 ? 0 : WORLD_X - 1;
       const xEnd = simTick & 1 ? WORLD_X : -1;
@@ -708,10 +730,30 @@
       const yEnd = simTick & 2 ? WORLD_Y : -1;
       const yStep = simTick & 2 ? 1 : -1;
 
-      let movedAny = false;
+      let totalMoved = 0;
+      let visualChanged = false;
+
+      function transfer(srcIdx, dstIdx, amount, srcZ, dstZ) {
+        if (amount <= 0) return;
+        const prevSrcVis = waterToVisualLevel(water[srcIdx]);
+        const prevDstVis = waterToVisualLevel(water[dstIdx]);
+        water[srcIdx] -= amount;
+        water[dstIdx] += amount;
+        totalMoved += amount;
+        layerHasWater[dstZ] = 1;
+        if (
+          waterToVisualLevel(water[srcIdx]) !== prevSrcVis ||
+          waterToVisualLevel(water[dstIdx]) !== prevDstVis
+        ) {
+          visualChanged = true;
+          markBlockWaterDirty(srcZ);
+          if (dstZ !== srcZ) markBlockWaterDirty(dstZ);
+        }
+      }
 
       // --- Pass 1: 重力落下（下から上へ走査し、空いている下のセルへ一気に落ちる） ---
       for (let z = 1; z < WORLD_Z; z++) {
+        if (!layerHasWater[z]) continue;
         for (let y = yStart; y !== yEnd; y += yStep) {
           for (let x = xStart; x !== xEnd; x += xStep) {
             const i = index(x, y, z);
@@ -719,53 +761,91 @@
             if (w === 0) continue;
 
             const below = index(x, y, z - 1);
-            if (blocks[below] === BLOCK_AIR && water[below] < BLOCK_SLICES) {
-              const fall = Math.min(w, BLOCK_SLICES - water[below]);
-              water[i] -= fall;
-              water[below] += fall;
+            if (blocks[below] === BLOCK_AIR && water[below] < WATER_MAX) {
+              const fall = Math.min(w, WATER_MAX - water[below]);
+              transfer(i, below, fall, z, z - 1);
               falling[below] = 1;
               if (water[i] > 0) falling[i] = 1;
               markBlockWaterDirty(z);
               markBlockWaterDirty(z - 1);
-              movedAny = true;
             }
           }
         }
       }
 
-      // --- Pass 2: 水平方向への拡散・低い場所の探索（テラリア式ランダム探索＋排水）・均等化 ---
+      // --- Pass 2: 後戻りしない下り排水（高所） ＋ 滑らかな湖面均等化（低所） ---
       const dirStart = simTick & 3;
-      const nIdxBuf = [0, 0, 0, 0];
-      const nDropBuf = [0, 0, 0, 0];
-      const nDistBuf = [255, 255, 255, 255];
+      const downhillBuf = [0, 0, 0, 0];
+      const basinBuf = [0, 0, 0, 0];
 
       for (let z = 0; z < WORLD_Z; z++) {
+        if (!layerHasWater[z]) continue;
+        let anyInLayer = 0;
+
         for (let y = yStart; y !== yEnd; y += yStep) {
           for (let x = xStart; x !== xEnd; x += xStep) {
             const i = index(x, y, z);
             let w = water[i];
             if (w === 0) continue;
+            anyInLayer = 1;
 
-            // 下にまだ空きがある（落下途中）なら水平拡散をスキップ
+            // 下にまだ空きがある（落下途中）なら水平拡散しない
             if (z > 0) {
               const below = index(x, y, z - 1);
-              if (blocks[below] === BLOCK_AIR && water[below] < BLOCK_SLICES) {
+              if (blocks[below] === BLOCK_AIR && water[below] < WATER_MAX) {
                 falling[i] = 1;
                 continue;
               }
             }
 
             const curDist = distToDrop[i];
-            const onSolidFloor = z === 0 || blocks[index(x, y, z - 1)] !== BLOCK_AIR;
 
-            // 隣接4方向の通行可能セル情報を集める
-            let count = 0;
-            let bestDownhillEmpty = -1;
-            let bestDownhillDist = curDist;
-            let activeFallIdx = -1;
-            let wanderIdx = -1;
-            let wanderCount = 0;
+            // A) 有効な未満水落ち口へ到達可能なセル (0 < curDist < 255):
+            //    厳密に distToDrop が小さくなる方向だけへ流す（単調減少＝往復振動が数学的に不可能！）
+            if (curDist > 0 && curDist < 255) {
+              let bestDist = curDist;
+              let bestCount = 0;
 
+              for (let d = 0; d < 4; d++) {
+                const dir = DIRS[(dirStart + d) & 3];
+                const nx = x + dir[0];
+                const ny = y + dir[1];
+                if (nx < 0 || nx >= WORLD_X || ny < 0 || ny >= WORLD_Y) continue;
+                const ni = index(nx, ny, z);
+                if (blocks[ni] !== BLOCK_AIR || water[ni] >= WATER_MAX) continue;
+
+                const nd = distToDrop[ni];
+                if (nd >= curDist) continue;
+
+                if (nd < bestDist) {
+                  bestDist = nd;
+                  downhillBuf[0] = ni;
+                  bestCount = 1;
+                } else if (nd === bestDist) {
+                  downhillBuf[bestCount++] = ni;
+                }
+              }
+
+              if (bestCount > 0) {
+                const pick =
+                  bestCount === 1
+                    ? 0
+                    : Math.floor(hash3(x + simTick * 5, y + simTick * 3, z) * bestCount);
+                const dst = downhillBuf[pick];
+                const room = WATER_MAX - water[dst];
+                // 薄い残水 (<= 10) は一塊で下り方向へ押し出して高所を完全に乾かす
+                const want = w <= 10 ? w : Math.max(4, Math.ceil(w * 0.55));
+                const flow = Math.min(w, room, want);
+                if (flow > 0) {
+                  transfer(i, dst, flow, z, z);
+                  continue;
+                }
+              }
+            }
+
+            // B) 安定した池・くぼみ内の水平均等化（差が3以上のときだけ素早く均等化 → 収束して完全静止）
+            //    ※ 排水路の途中 (0 < curDist < 255) からは上流 (dist > curDist) へ絶対に押し戻さない
+            let bCount = 0;
             for (let d = 0; d < 4; d++) {
               const dir = DIRS[(dirStart + d) & 3];
               const nx = x + dir[0];
@@ -773,123 +853,57 @@
               if (nx < 0 || nx >= WORLD_X || ny < 0 || ny >= WORLD_Y) continue;
               const ni = index(nx, ny, z);
               if (blocks[ni] !== BLOCK_AIR) continue;
-
-              const nw = water[ni];
-              const nDist = distToDrop[ni];
-              let hasOpenDrop = 0;
-              if (z > 0) {
-                const nBelow = index(nx, ny, z - 1);
-                if (blocks[nBelow] === BLOCK_AIR && water[nBelow] < BLOCK_SLICES) {
-                  hasOpenDrop = 1;
-                  if (nw < BLOCK_SLICES && activeFallIdx === -1) {
-                    activeFallIdx = ni;
-                  }
-                }
-              }
-
-              // 低い場所へ近づく空きマス候補
-              if (nw === 0 && nDist < bestDownhillDist) {
-                bestDownhillDist = nDist;
-                bestDownhillEmpty = ni;
-              }
-              // テラリア風のランダム探索候補（空きマスで、落ち口から極端に遠ざからない方向）
-              if (nw === 0 && curDist < 255 && nDist <= curDist) {
-                wanderCount++;
-                if (hash3(x + simTick * 7, y + d * 13, z + simTick) * wanderCount < 1) {
-                  wanderIdx = ni;
-                }
-              }
-
-              if (nw < w || hasOpenDrop || (onSolidFloor && curDist > 0 && curDist < 255 && nDist < curDist && nw < BLOCK_SLICES)) {
-                nIdxBuf[count] = ni;
-                nDropBuf[count] = hasOpenDrop;
-                nDistBuf[count] = nDist;
-                count++;
+              if (curDist > 0 && curDist < 255 && distToDrop[ni] > curDist) continue;
+              if (water[ni] <= w - 3) {
+                basinBuf[bCount++] = ni;
               }
             }
 
-            if (count === 0) continue;
-
-            // ★ テラリア式・高所残水ドレイン:
-            // 高い平地（落ち口へ到達可能 & 地面の上）に残った薄い水 (w === 1) は、
-            // ランダムに低い場所を探しつつ落ち口方向へ移動して、高所に水が残らないようにする
-            if (w === 1 && onSolidFloor && curDist > 0 && curDist < 255) {
-              // 1. すぐ横に空いている滝落ち口があれば即座に流し落とす
-              if (activeFallIdx !== -1 && water[activeFallIdx] < BLOCK_SLICES) {
-                water[i] = 0;
-                water[activeFallIdx]++;
-                falling[activeFallIdx] = 1;
-                markBlockWaterDirty(z);
-                movedAny = true;
-                continue;
-              }
-
-              // 2. 低い場所へ近づく空きマスへ進む（たまにランダム探索も混ぜる）
-              const rnd = hash3(x * 3 + simTick, y * 5 - simTick, z + 31);
-              let target = -1;
-              if (rnd < 0.25 && wanderIdx !== -1) {
-                target = wanderIdx;
-              } else if (bestDownhillEmpty !== -1) {
-                target = bestDownhillEmpty;
-              } else {
-                // 下り方向の隣に既に薄い水 (1..2) があれば合流させて押し流す
-                // （満水に近い湖へ逆流させないよう nw <= 2 に限定）
-                for (let k = 0; k < count; k++) {
-                  const ni = nIdxBuf[k];
-                  if (nDistBuf[k] < curDist && water[ni] <= 2) {
-                    target = ni;
-                    break;
+            if (bCount > 0) {
+              for (let k = 0; k < bCount && w >= 3; k++) {
+                let minIdx = -1;
+                let minW = w;
+                for (let j = 0; j < bCount; j++) {
+                  const ni = basinBuf[j];
+                  if (water[ni] < minW) {
+                    minW = water[ni];
+                    minIdx = ni;
                   }
                 }
+                if (minIdx === -1 || w - minW < 3) break;
+                const flow = Math.max(1, Math.floor((w - minW) / 2));
+                transfer(i, minIdx, flow, z, z);
+                w = water[i];
               }
-
-              if (target !== -1) {
-                water[i] = 0;
-                water[target]++;
-                markBlockWaterDirty(z);
-                movedAny = true;
-                continue;
-              }
-            }
-
-            // 通常の水平拡散・均等化（落ち口に近い方向を優先して配分）
-            let changed = false;
-            for (let pass = 0; pass < 4 && w > 0; pass++) {
-              let bestSlot = -1;
-              let bestScore = 9999;
-              for (let k = 0; k < count; k++) {
-                const ni = nIdxBuf[k];
-                const nw = water[ni];
-                const isCloserToDrop = onSolidFloor && curDist < 255 && nDistBuf[k] < curDist;
-                const minDiff = nDropBuf[k] ? 1 : isCloserToDrop ? 1 : 2;
-                if (w - nw >= minDiff) {
-                  // 落ち口あり → 落ち口に近い → 水位が低い の順で優先
-                  const score = nw * 4 - nDropBuf[k] * 20 - (isCloserToDrop ? 8 : 0);
-                  if (score < bestScore) {
-                    bestScore = score;
-                    bestSlot = ni;
-                  }
-                }
-              }
-              if (bestSlot === -1) break;
-              water[i]--;
-              water[bestSlot]++;
-              w--;
-              changed = true;
-            }
-
-            if (changed) {
-              markBlockWaterDirty(z);
-              movedAny = true;
             }
           }
         }
+
+        layerHasWater[z] = anyInLayer;
       }
 
-      if (movedAny) {
+      if (visualChanged) {
         rebuildDirtyWaterSlices();
       }
-      return movedAny;
+
+      // テラリア式スリープ判定：見た目の変化も十分な移動もなくなったら完全静止にする
+      if (totalMoved === 0) {
+        calmStreak += 3;
+      } else if (!visualChanged && totalMoved <= 6) {
+        calmStreak++;
+      } else {
+        calmStreak = 0;
+      }
+
+      if (calmStreak >= 12) {
+        waterSettled = true;
+        // 滝フラグをクリアして静止水色に確定
+        falling.fill(0);
+        dirtyWaterSlices.fill(1);
+        rebuildDirtyWaterSlices();
+      }
+
+      return totalMoved > 0;
     }
 
     function computeCurrentTotalWater() {
@@ -905,7 +919,7 @@
       const by = Math.floor(wy);
       const bz = Math.floor(wz);
       if (!inBounds(bx, by, bz)) return 0;
-      return water[index(bx, by, bz)];
+      return waterToVisualLevel(water[index(bx, by, bz)]);
     }
 
     function findFloorBelow(wx, wy, fromZ) {
@@ -921,7 +935,6 @@
       return { floorZ: 0, blockType: BLOCK_AIR };
     }
 
-    // 初期の水を配置（少しだけ事前シミュレーションせず、開いた瞬間から山から流れ下る様子を見せる！）
     resetWaterToHighlands();
 
     return {
@@ -950,6 +963,7 @@
       stepWater,
       resetWaterToHighlands,
       getWaterLevelAt,
+      isWaterSettled: () => waterSettled,
       getInitialTotalWater: () => totalWaterUnits,
       computeCurrentTotalWater,
     };
