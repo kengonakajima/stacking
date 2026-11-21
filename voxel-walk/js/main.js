@@ -1,8 +1,8 @@
 /**
  * main.js
  * ------------------------------------------------------------
- * ボクセルワールドのウォークスルー操作（移動・ジャンプ・段差登り・当たり判定）と
- * カメラ操作、右側観察パネルのUI制御を行います。
+ * 64x64 ボクセルワールドのウォークスルー（歩行・ジャンプ・水中遊泳）、
+ * テラリア式総量保存の水流ステップ実行、右側観察パネルのUI制御を行います。
  */
 (function (global) {
   "use strict";
@@ -16,7 +16,8 @@
     drawSingleModelPreview,
   } = global.VoxelWalk;
 
-  const world = createWorld();
+  let worldSeed = 104729;
+  let world = createWorld(worldSeed);
 
   // ============================================================
   // 描画・観察設定
@@ -30,41 +31,35 @@
     showWireframe: false,
   };
 
-  // カメラ状態（初期はアイソメトリック風の45°/45°）
   const camera = {
-    x: 10.5,
-    y: 10.5,
-    z: 2.0,
-    yaw: Math.PI / 4, // 45°
+    x: world.spawnX,
+    y: world.spawnY,
+    z: world.spawnZ,
+    yaw: Math.PI / 4,
     pitchDeg: 45,
-    zoom: 3.4,
+    zoom: 3.0,
     screenCenterX: 400,
     screenCenterY: 300,
   };
 
-  // プレイヤー状態（ブロック座標系）
   const player = {
-    x: 10.5,
-    y: 10.5,
-    z: 2.0,
+    x: world.spawnX,
+    y: world.spawnY,
+    z: world.spawnZ,
     vz: 0,
     radius: 0.27,
     height: 1.5,
     facing: 0,
-    onGround: false,
+    onGround: true,
+    inWater: false,
+    waterDepth: 0,
     isMoving: false,
     walkCycle: 0,
   };
 
-  // 入力状態
   const keys = Object.create(null);
-  const drag = {
-    active: false,
-    lastX: 0,
-    lastY: 0,
-  };
+  const drag = { active: false, lastX: 0, lastY: 0 };
 
-  // 右パネル・単体モデルプレビュー状態
   const preview = {
     modelId: "grass",
     angle: Math.PI / 4,
@@ -94,6 +89,10 @@
   const hoverLayerInfo = document.getElementById("hover-layer-info");
   const sliceGrid = document.getElementById("slice-grid");
 
+  const valWaterTotal = document.getElementById("val-water-total");
+  const btnReflowWater = document.getElementById("btn-reflow-water");
+  const btnRegenWorld = document.getElementById("btn-regen-world");
+
   const sliderSpacing = document.getElementById("slider-spacing");
   const valSpacing = document.getElementById("val-spacing");
   const sliderCutaway = document.getElementById("slider-cutaway");
@@ -110,13 +109,16 @@
   const chkPixelated = document.getElementById("chk-pixelated");
   const chkWireframe = document.getElementById("chk-wireframe");
 
-  // カッタースライダーの上限をワールドの実高さに合わせる
-  sliderCutaway.max = String(world.maxUsedSlice);
-  sliderCutaway.value = String(world.maxUsedSlice);
-  valCutaway.textContent = `${world.maxUsedSlice} / ${world.maxUsedSlice}`;
+  function syncWorldSliderBounds() {
+    sliderCutaway.max = String(world.maxUsedSlice);
+    settings.maxVisibleSlice = world.maxUsedSlice;
+    sliderCutaway.value = String(world.maxUsedSlice);
+    valCutaway.textContent = `${world.maxUsedSlice} / ${world.maxUsedSlice}`;
+    valWaterTotal.textContent = `${world.computeCurrentTotalWater()} / ${world.getInitialTotalWater()} (一定)`;
+  }
 
   // ============================================================
-  // 3D ボクセル当たり判定（AABB vs ボクセルグリッド）
+  // 3D ボクセル当たり判定
   // ============================================================
   function hasSolidAtLayer(px, py, bz) {
     const r = player.radius;
@@ -139,7 +141,6 @@
     const minZ = Math.floor(pz + 0.001);
     const maxZ = Math.floor(pz + player.height - 0.001);
 
-    // ワールド外周からは落ちないようにガード
     if (px - r < 0 || px + r > world.sizeX || py - r < 0 || py + r > world.sizeY) {
       return true;
     }
@@ -153,19 +154,33 @@
   }
 
   function resetPlayerPosition() {
-    player.x = 10.5;
-    player.y = 10.5;
-    player.z = 2.0;
+    player.x = world.spawnX;
+    player.y = world.spawnY;
+    player.z = world.spawnZ;
     player.vz = 0;
     player.facing = 0;
     player.onGround = true;
+    camera.x = player.x;
+    camera.y = player.y;
+    camera.z = player.z;
   }
 
   function resetCameraView() {
     camera.yaw = Math.PI / 4;
     camera.pitchDeg = 45;
-    camera.zoom = 3.4;
+    camera.zoom = 3.0;
     syncCameraUI();
+  }
+
+  function regenerateWorld() {
+    if (preview.buildupTimer) {
+      clearInterval(preview.buildupTimer);
+      preview.buildupTimer = null;
+    }
+    worldSeed = (worldSeed * 1103515245 + 12345) & 0x7fffffff;
+    world = createWorld(worldSeed);
+    syncWorldSliderBounds();
+    resetPlayerPosition();
   }
 
   function normalizeDeg(deg) {
@@ -188,10 +203,9 @@
   }
 
   // ============================================================
-  // プレイヤー移動・ジャンプ・重力更新
+  // プレイヤー移動・ジャンプ・水中遊泳
   // ============================================================
   function updatePlayer(dt) {
-    // キーによるカメラ回転
     const yawSpeed = 1.7;
     if (keys["KeyQ"]) {
       camera.yaw -= yawSpeed * dt;
@@ -202,7 +216,11 @@
       syncCameraUI();
     }
 
-    // 画面の上下左右入力を取得
+    // 足元の水深チェック
+    const wFeet = world.getWaterLevelAt(player.x, player.y, player.z + 0.08);
+    player.waterDepth = wFeet;
+    player.inWater = wFeet > 0;
+
     let ix = 0;
     let iy = 0;
     if (keys["KeyW"] || keys["ArrowUp"]) iy -= 1;
@@ -217,24 +235,21 @@
       ix /= len;
       iy /= len;
 
-      // カメラの水平角 (yaw) に合わせてワールド空間の移動方向へ変換
       const cos = Math.cos(-camera.yaw);
       const sin = Math.sin(-camera.yaw);
       const wx = ix * cos - iy * sin;
       const wy = ix * sin + iy * cos;
 
-      const walkSpeed = 4.6; // ブロック/秒
+      const walkSpeed = player.inWater ? 3.9 : 5.4;
       const stepX = wx * walkSpeed * dt;
       const stepY = wy * walkSpeed * dt;
 
-      // 向きをスムーズに補間
       const targetFacing = Math.atan2(wy, wx);
       let diff = targetFacing - player.facing;
       while (diff > Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
       player.facing += diff * Math.min(1, dt * 14);
 
-      // X軸・Y軸の水平移動（段差にはワープせず壁として止まり、Spaceジャンプで登る）
       const nextX = player.x + stepX;
       if (!collidesAt(nextX, player.y, player.z)) {
         player.x = nextX;
@@ -248,15 +263,22 @@
       player.walkCycle += dt;
     }
 
-    // ジャンプ（1.25ブロック程度の高さまで跳べる）
-    if (keys["Space"] && player.onGround) {
-      player.vz = 7.4;
-      player.onGround = false;
+    // ジャンプ（地上）または泳ぎ上がり（水中）
+    if (keys["Space"]) {
+      if (player.onGround) {
+        player.vz = 7.6;
+        player.onGround = false;
+      } else if (player.inWater) {
+        player.vz = Math.min(5.2, player.vz + 22 * dt);
+      }
     }
 
-    // 重力・垂直移動（床との境界でチラつかないよう厳密に層ごとに接地判定する）
-    const gravity = 20.0;
+    // 重力（水中では少し緩やか）
+    const gravity = player.inWater ? 9.5 : 20.0;
     player.vz -= gravity * dt;
+    if (player.inWater && player.vz < -2.6) {
+      player.vz = -2.6;
+    }
     const nextZ = player.z + player.vz * dt;
 
     if (player.vz <= 0) {
@@ -283,7 +305,6 @@
         }
       }
     } else {
-      // 上昇中：アーチ橋の下など天井との衝突チェック
       const startCeil = Math.floor(player.z + player.height);
       const endCeil = Math.floor(nextZ + player.height);
       let hitCeiling = false;
@@ -301,18 +322,21 @@
       player.onGround = false;
     }
 
-    // カメラがプレイヤーを滑らかに追従
     const follow = Math.min(1, dt * 7);
     camera.x += (player.x - camera.x) * follow;
     camera.y += (player.y - camera.y) * follow;
     camera.z += (player.z - camera.z) * Math.min(1, dt * 4.5);
 
-    // HUD 更新（文字幅がぶれて折り返さないよう簡潔な固定表現にする）
+    // HUD 更新（固定幅・1行維持）
     hudPos.textContent = `${player.x.toFixed(1)}, ${player.y.toFixed(1)}, ${player.z.toFixed(1)}`;
     const floor = world.findFloorBelow(player.x, player.y, player.z + 0.05);
-    hudGround.textContent = player.onGround
-      ? BLOCK_NAMES[floor.blockType] || "地面"
-      : "空中";
+    if (player.inWater) {
+      hudGround.textContent = `水中 (${player.waterDepth}/8)`;
+    } else if (player.onGround) {
+      hudGround.textContent = BLOCK_NAMES[floor.blockType] || "地面";
+    } else {
+      hudGround.textContent = "空中";
+    }
   }
 
   // ============================================================
@@ -368,7 +392,7 @@
     const h = previewCanvas.height;
     previewCtx.clearRect(0, 0, w, h);
 
-    const scale = model.id === "player" ? 5.6 : 5.2;
+    const scale = model.id === "player" ? 5.6 : 6.2;
     const pitchRad = (camera.pitchDeg * Math.PI) / 180;
     const totalLift = (model.layerCount - 1) * Math.cos(pitchRad) * scale * settings.sliceSpacingMult;
     const baseY = Math.min(h - 24, h / 2 + totalLift * 0.48 + 10);
@@ -423,7 +447,7 @@
         return;
       }
       setCutaway(current);
-    }, 55);
+    }, 50);
   }
 
   modelTabs.addEventListener("click", (ev) => {
@@ -440,7 +464,6 @@
     preview.lastDragX = ev.clientX;
   });
 
-  // ワールドキャンバスのドラッグでカメラ自由回転＆傾き調整
   worldCanvas.addEventListener("mousedown", (ev) => {
     drag.active = true;
     drag.lastX = ev.clientX;
@@ -471,8 +494,8 @@
     "wheel",
     (ev) => {
       ev.preventDefault();
-      const factor = ev.deltaY > 0 ? 0.92 : 1.08;
-      camera.zoom = Math.max(1.8, Math.min(6.0, camera.zoom * factor));
+      const factor = ev.deltaY > 0 ? 0.91 : 1.10;
+      camera.zoom = Math.max(1.0, Math.min(6.5, camera.zoom * factor));
     },
     { passive: false }
   );
@@ -497,6 +520,12 @@
     }
     setCutaway(world.maxUsedSlice);
   });
+
+  btnReflowWater.addEventListener("click", () => {
+    world.resetWaterToHighlands();
+    valWaterTotal.textContent = `${world.computeCurrentTotalWater()} / ${world.getInitialTotalWater()} (一定)`;
+  });
+  btnRegenWorld.addEventListener("click", regenerateWorld);
 
   sliderYaw.addEventListener("input", () => {
     const deg = parseFloat(sliderYaw.value);
@@ -544,15 +573,29 @@
   window.addEventListener("resize", resizeWorldCanvas);
 
   // ============================================================
-  // メインループ
+  // メインループ（水流シミュレーションは約 10Hz で実行）
   // ============================================================
   let lastTime = performance.now();
+  let waterAccum = 0;
+  let hudWaterAccum = 0;
 
   function tick(now) {
     const dt = Math.min(0.05, (now - lastTime) / 1000);
     lastTime = now;
 
     updatePlayer(dt);
+
+    // テラリア式・総量保存の水流ステップ実行
+    waterAccum += dt;
+    if (waterAccum >= 0.095) {
+      waterAccum = 0;
+      const moved = world.stepWater();
+      hudWaterAccum++;
+      if (moved || hudWaterAccum >= 10) {
+        hudWaterAccum = 0;
+        valWaterTotal.textContent = `${world.computeCurrentTotalWater()} / ${world.getInitialTotalWater()} (一定)`;
+      }
+    }
 
     const w = worldCanvas.width;
     const h = worldCanvas.height;
@@ -561,7 +604,7 @@
     camera.screenCenterX = w / 2;
     camera.screenCenterY = h / 2 + 12;
 
-    renderVoxelWorld(worldCtx, world, player, camera, settings);
+    renderVoxelWorld(worldCtx, world, player, camera, settings, now * 0.001);
     renderPreview(dt);
 
     requestAnimationFrame(tick);
@@ -569,6 +612,7 @@
 
   // 起動
   resizeWorldCanvas();
+  syncWorldSliderBounds();
   rebuildSliceGrid();
   syncCameraUI();
   resetPlayerPosition();

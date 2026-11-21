@@ -61,6 +61,9 @@
         <div class="model-tabs" id="model-tabs">
           <button class="tab-btn active" data-model="grass">草ブロック</button>
           <button class="tab-btn" data-model="dirt">土ブロック</button>
+          <button class="tab-btn" data-model="wood">木の幹</button>
+          <button class="tab-btn" data-model="leaves">葉ブロック</button>
+          <button class="tab-btn" data-model="water">水 (8段階)</button>
           <button class="tab-btn" data-model="player">プレイヤー</button>
         </div>
 
@@ -78,8 +81,19 @@
 
       <section class="panel-section">
         <div class="section-header">
-          <h2>2. ワールド全体のスタッキング観察</h2>
+          <h2>2. 64×64 ワールド &amp; 水流コントロール</h2>
           <span class="hint">リアルタイム反映</span>
+        </div>
+
+        <div class="control-block">
+          <div class="control-label-row">
+            <span>水の総量（テラリア式保存）</span>
+            <span id="val-water-total" class="mono-val">3400 / 3400 (一定)</span>
+          </div>
+          <div class="preset-row">
+            <button id="btn-reflow-water" class="chip-btn chip-accent">💧 高所から流し直す</button>
+            <button id="btn-regen-world" class="chip-btn">🌲 新しい地形を生成</button>
+          </div>
         </div>
 
         <div class="control-block">
@@ -153,18 +167,16 @@
           <h2>3. ボクセル×スタッキングの仕組み</h2>
         </div>
         <p class="explain-text">
-          世界全体を<strong>高さごとの2D水平断面キャンバス（<code>worldSlices[z]</code>）</strong>に焼き込み、
-          下から1枚ずつ重ねて描画します。プレイヤーも同じ高さ <code>z</code> のタイミングで差し込むため、
-          <strong>丘の裏に隠れたり、橋の下をくぐったりしても前後関係が破綻しません。</strong>
+          64×64×10 の世界を<strong>高さごとの2D水平断面キャンバス（<code>worldSlices[z]</code>）</strong>に焼き込み、
+          半透明の<strong>8段階水スライス</strong>（1〜8層＝水深1/8〜8/8）とスクロールする水面波紋、
+          さらにプレイヤーを同じ高さ <code>z</code> で差し込んで重ねています。
         </p>
         <pre class="code-snippet"><code>// js/renderer.js の核心ループ
-for (let z = 0; z &lt; maxSliceZ; z++) {
-  // 1. 世界全体の高さ z の断面を1枚描画
-  drawSlice(worldSlices[z], z);
-  // 2. プレイヤーがその高さ z に居れば差し込む
-  if (z &gt;= playerMinZ &amp;&amp; z &lt;= playerMaxZ) {
-    drawPlayerSlice(z - playerMinZ, z);
-  }
+for (let z = 0; z &lt; limitZ; z++) {
+  drawSlice(worldSlices[z], z);      // 地形・木
+  drawPlayerSliceIfInRange(z);       // プレイヤー
+  drawWaterBody(waterBodySlices[z]); // 半透明水体積
+  drawWaterSurfaceAnim(z, frame);    // 波紋アニメ水面
 }</code></pre>
       </section>
     </aside>
