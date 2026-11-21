@@ -168,21 +168,58 @@
 
   /**
    * 64x64 ワールドの水面アニメーション用タイルテクスチャ（16フレーム, 256x256）を事前生成。
-   * 空間（16px周期）も時間（16フレーム周期）も sin/cos の整数倍周期で計算するため、
-   * 端の継ぎ目もループの継ぎ目も一切なく、穏やかに連続して揺らぐ水面になる。
+   * 水面特有の網目模様（コースティクス）を作る「周期 Worley / Voronoi セルラーノイズ」を使用。
+   * - セル内部は透明度が高く水底がくっきり透ける
+   * - セル境界 (F2 - F1 ≈ 0) に細いアクア色の光の網目が浮かび、
+   *   特徴点が円軌道を描くことで空間(32px)も時間(16フレーム)も完全にシームレスに揺らぐ
    */
   function buildWaterAnimFrames(worldBlocksX, worldBlocksY) {
     const pxPerBlock = 4; // 64 * 4 = 256px
     const w = worldBlocksX * pxPerBlock;
     const h = worldBlocksY * pxPerBlock;
-    const tileSize = 16; // 4ブロック周期のゆったりしたさざ波
-    const frameCount = 16; // 16フレームで完全に滑らかに1周ループ
+    const tileSize = 32; // 8x8ブロック周期の大きなシームレスタイル
+    const halfTile = tileSize * 0.5;
+    const frameCount = 16;
     const frames = [];
 
+    // 4x4 の層化ジッターグリッドで16個の特徴点を配置（ムラのない美しいセル構造）
+    const gridN = 4;
+    const cellSpan = tileSize / gridN; // 8px
+    const basePoints = [];
+    for (let gy = 0; gy < gridN; gy++) {
+      for (let gx = 0; gx < gridN; gx++) {
+        const id = gy * gridN + gx;
+        const jx = (hash3(gx, gy, 401) - 0.5) * cellSpan * 0.65;
+        const jy = (hash3(gx, gy, 709) - 0.5) * cellSpan * 0.65;
+        basePoints.push({
+          bx: (gx + 0.5) * cellSpan + jx,
+          by: (gy + 0.5) * cellSpan + jy,
+          orbitR: 1.1 + hash3(gx, gy, 911) * 0.7,
+          phase0: hash3(gx, gy, 1301) * Math.PI * 2,
+          dir: id % 2 === 0 ? 1 : -1,
+        });
+      }
+    }
+
     const TWO_PI = Math.PI * 2;
+    const curX = new Float32Array(basePoints.length);
+    const curY = new Float32Array(basePoints.length);
 
     for (let f = 0; f < frameCount; f++) {
       const phase = (f / frameCount) * TWO_PI;
+
+      // 各特徴点を閉じた円軌道上で動かす（16フレームで完全に元の位置に戻る）
+      for (let p = 0; p < basePoints.length; p++) {
+        const bp = basePoints[p];
+        const a = bp.phase0 + phase * bp.dir;
+        let px = bp.bx + Math.cos(a) * bp.orbitR;
+        let py = bp.by + Math.sin(a) * bp.orbitR;
+        px = ((px % tileSize) + tileSize) % tileSize;
+        py = ((py % tileSize) + tileSize) % tileSize;
+        curX[p] = px;
+        curY[p] = py;
+      }
+
       const tile = document.createElement("canvas");
       tile.width = tileSize;
       tile.height = tileSize;
@@ -190,37 +227,43 @@
       const tImg = tCtx.createImageData(tileSize, tileSize);
 
       for (let y = 0; y < tileSize; y++) {
-        const v = (y / tileSize) * TWO_PI;
         for (let x = 0; x < tileSize; x++) {
-          const u = (x / tileSize) * TWO_PI;
-
-          // 3つの穏やかな正弦波を重ねる（すべて空間・時間ともに厳密に周期一致）
-          const w1 = Math.sin(u + v + phase);
-          const w2 = Math.sin(u * 2 - v + phase);
-          const w3 = Math.cos(v * 2 - phase);
-          const hVal = w1 * 0.52 + w2 * 0.26 + w3 * 0.22; // -1 .. +1
-          const t = (hVal + 1) * 0.5; // 0 .. 1
-
-          // 穏やかでコントラスト控えめな水色グラデーション（強い白反射は入れない）
-          let r = 36 + t * 56;
-          let g = 138 + t * 56;
-          let b = 198 + t * 38;
-          let a = 112 + t * 26;
-
-          // 波の山だけごく控えめに明るい水色にする
-          if (t > 0.84) {
-            const softPeak = (t - 0.84) / 0.16;
-            r += softPeak * 28;
-            g += softPeak * 18;
-            b += softPeak * 8;
-            a += softPeak * 12;
+          // トーラス周期距離で最近傍 d1 と 2番目 d2 を求める（Worley / Voronoi）
+          let d1 = 9999;
+          let d2 = 9999;
+          for (let p = 0; p < basePoints.length; p++) {
+            let dx = Math.abs(x - curX[p]);
+            if (dx > halfTile) dx = tileSize - dx;
+            let dy = Math.abs(y - curY[p]);
+            if (dy > halfTile) dy = tileSize - dy;
+            const dist = Math.hypot(dx, dy);
+            if (dist < d1) {
+              d2 = d1;
+              d1 = dist;
+            } else if (dist < d2) {
+              d2 = dist;
+            }
           }
 
+          // F2 - F1 が 0 に近いほど「水面の光の網目（コースティクス稜線）」
+          const ridge = d2 - d1;
+          // 鋭い網目ライン (0..1)
+          const web = Math.max(0, 1 - ridge / 1.65);
+          const webSharp = web * web;
+          // セル中心は暗く透明、縁に近づくほどわずかに明るい水色
+          const cellEdge = Math.min(1, d1 / 5.5);
+
+          // ベースは澄んだ透明水色（低アルファで底が見える）＋控えめで上品なアクア網目
+          let r = 22 + cellEdge * 20 + webSharp * 72;
+          let g = 130 + cellEdge * 26 + webSharp * 62;
+          let b = 198 + cellEdge * 18 + webSharp * 32;
+          let a = 48 + cellEdge * 22 + webSharp * 68;
+
           const idx = (y * tileSize + x) * 4;
-          tImg.data[idx] = Math.round(r);
-          tImg.data[idx + 1] = Math.round(g);
-          tImg.data[idx + 2] = Math.round(b);
-          tImg.data[idx + 3] = Math.round(a);
+          tImg.data[idx] = Math.min(255, Math.round(r));
+          tImg.data[idx + 1] = Math.min(255, Math.round(g));
+          tImg.data[idx + 2] = Math.min(255, Math.round(b));
+          tImg.data[idx + 3] = Math.min(255, Math.round(a));
         }
       }
       tCtx.putImageData(tImg, 0, 0);
@@ -294,16 +337,15 @@
           const idx = (ly * BLOCK_SIZE + lx) * 4;
           if (isTop) {
             const crest = (lx + ly) % 4 === 0;
-            img.data[idx] = crest ? 175 : 68;
-            img.data[idx + 1] = crest ? 236 : 186;
-            img.data[idx + 2] = 250;
-            img.data[idx + 3] = crest ? 195 : 148;
+            img.data[idx] = crest ? 158 : 78;
+            img.data[idx + 1] = crest ? 232 : 190;
+            img.data[idx + 2] = 252;
+            img.data[idx + 3] = crest ? 176 : 122;
           } else {
-            const depthShade = 0.72 + (lz / (BLOCK_SLICES - 1)) * 0.28;
-            img.data[idx] = Math.round(32 * depthShade);
-            img.data[idx + 1] = Math.round(148 * depthShade);
-            img.data[idx + 2] = Math.round(218 * depthShade);
-            img.data[idx + 3] = 95;
+            img.data[idx] = 10;
+            img.data[idx + 1] = 92;
+            img.data[idx + 2] = 174;
+            img.data[idx + 3] = 24;
           }
         }
       }

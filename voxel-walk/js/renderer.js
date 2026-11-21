@@ -36,7 +36,7 @@
     const blockScreenPx = BLOCK_SIZE * cam.zoom;
 
     const worldSlices = world.getSlices(settings.useAO, settings.useEdgeHighlight);
-    const animFrame = Math.floor(timeSec * 5.0) % waterAnimFrames.length;
+    const animFrame = Math.floor(timeSec * 3.6) % waterAnimFrames.length;
     const animTex = waterAnimFrames[animFrame];
 
     // プレイヤーの現在ポーズのスライス配列を選択
