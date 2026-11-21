@@ -9,6 +9,7 @@
 
   const {
     BLOCK_AIR,
+    BLOCK_SLICES,
     BLOCK_NAMES,
     PREVIEW_MODELS,
     createWorld,
@@ -247,34 +248,67 @@
   }
 
   /**
-   * プレイヤーからカメラ方向への平行投影レイ＋真上天井を判定し、
-   * 洞窟内や崖の裏でプレイヤーがブロックに隠れているか調べる。
+   * プレイヤーの身体各点からカメラ視線方向へスライス単位でレイマーチし、
+   * 真上に天井があるかではなく「カメラから見てプレイヤーが実際に隠れているか」を正確に判定する。
    */
-  function checkPlayerOccluded() {
-    // 1. 真上に屋根があるか（洞窟・トンネル・オーバーハング直下）
-    const pbx = Math.floor(player.x);
-    const pby = Math.floor(player.y);
-    const headBz = Math.floor(player.z + player.height);
-    if (world.skyRoofDistance(pbx, pby, headBz) > 0) {
-      return true;
+  function isPointOccludedFromCamera(ox, oy, startSlice, rayDx, rayDy, maxSlice) {
+    const invSlices = 1 / BLOCK_SLICES;
+    for (let s = startSlice + 1; s < maxSlice; s++) {
+      const dz = (s - startSlice) * invSlices;
+      const rx = Math.floor(ox + rayDx * dz);
+      const ry = Math.floor(oy + rayDy * dz);
+      if (rx < 0 || ry < 0 || rx >= world.sizeX || ry >= world.sizeY) {
+        break;
+      }
+      const bz = Math.floor(s * invSlices);
+      const lz = s - bz * BLOCK_SLICES;
+      if (bz >= world.sizeZ) {
+        // 最上段ブロックの露出上面キャップ（共有境界スライス lz === 0）
+        if (bz === world.sizeZ && lz === 0 && world.getBlock(rx, ry, world.sizeZ - 1) !== BLOCK_AIR) {
+          return true;
+        }
+        break;
+      }
+      if (world.getBlock(rx, ry, bz) !== BLOCK_AIR) {
+        return true;
+      }
+      // 1段下ブロックの露出上面キャップ（lz === 0）も描画されるため遮蔽として判定
+      if (lz === 0 && bz > 0 && world.getBlock(rx, ry, bz - 1) !== BLOCK_AIR) {
+        return true;
+      }
     }
+    return false;
+  }
 
-    // 2. カメラ方向へのレイマーチ（崖や木の裏に隠れた場合も自動検出）
+  function checkPlayerOccluded() {
     const pitchRad = (camera.pitchDeg * Math.PI) / 180;
     const cotPitch = Math.cos(pitchRad) / Math.max(0.15, Math.sin(pitchRad));
     const stepPerZ = cotPitch * settings.sliceSpacingMult;
-    const rayDx = stepPerZ * Math.sin(camera.yaw);
-    const rayDy = stepPerZ * Math.cos(camera.yaw);
+    const cosYaw = Math.cos(camera.yaw);
+    const sinYaw = Math.sin(camera.yaw);
+    const rayDx = stepPerZ * sinYaw;
+    const rayDy = stepPerZ * cosYaw;
 
-    const startZ = player.z + 1.05;
-    const maxDz = world.sizeZ - startZ;
-    for (let dz = 0.55; dz <= maxDz; dz += 0.35) {
-      const rx = Math.floor(player.x + rayDx * dz);
-      const ry = Math.floor(player.y + rayDy * dz);
-      const rz = Math.floor(startZ + dz);
-      if (!world.inBounds(rx, ry, rz)) break;
-      if (world.getBlock(rx, ry, rz) !== BLOCK_AIR) {
-        return true;
+    const baseSlice = Math.round(player.z * BLOCK_SLICES);
+    const maxSlice = Math.min(world.maxUsedSlice, settings.maxVisibleSlice);
+
+    // 画面右方向のオフセット（左右の肩のサンプル位置）
+    const rightX = cosYaw * 0.18;
+    const rightY = -sinYaw * 0.18;
+
+    // 頭・胴体・左右の肩の4点をカメラ視線レイで検査し、2点以上遮蔽されていれば実際に隠れていると判定
+    let hits = 0;
+    const samples = [
+      [player.x, player.y, baseSlice + 10], // 頭・顔
+      [player.x, player.y, baseSlice + 6], // 胴体中央
+      [player.x - rightX, player.y - rightY, baseSlice + 8], // 左肩
+      [player.x + rightX, player.y + rightY, baseSlice + 8], // 右肩
+    ];
+    for (let i = 0; i < samples.length; i++) {
+      const sp = samples[i];
+      if (isPointOccludedFromCamera(sp[0], sp[1], sp[2], rayDx, rayDy, maxSlice)) {
+        hits++;
+        if (hits >= 2) return true;
       }
     }
     return false;
@@ -505,7 +539,7 @@
     if (Math.abs(settings.occlusionFade - targetFade) < 0.005) {
       settings.occlusionFade = targetFade;
     }
-    badgeOcclusion.textContent = occluded ? "透視ON（遮蔽中）" : "待機中（屋外）";
+    badgeOcclusion.textContent = occluded ? "透視ON（遮蔽中）" : "待機中（視界良好）";
     badgeOcclusion.classList.toggle("active", occluded);
 
     // 現在位置の明るさ (0..15) と松明本数を表示
