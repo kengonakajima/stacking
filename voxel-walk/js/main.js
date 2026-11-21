@@ -418,7 +418,10 @@
     hudPos.textContent = `${player.x.toFixed(1)}, ${player.y.toFixed(1)}, ${player.z.toFixed(1)}`;
     hudBiome.textContent = world.getBiomeNameAt(player.x, player.y, player.z + 1.0);
     const floor = world.findFloorBelow(player.x, player.y, player.z + 0.05);
-    if (player.inWater) {
+    const inLava = world.getLavaLevelAt(player.x, player.y, player.z + 0.08) > 0;
+    if (inLava) {
+      hudGround.textContent = "溶岩";
+    } else if (player.inWater) {
       hudGround.textContent = `水中 (${player.waterDepth}/8)`;
     } else if (player.onGround) {
       hudGround.textContent = BLOCK_NAMES[floor.blockType] || "地面";
@@ -580,6 +583,7 @@
   // ============================================================
   let lastTime = performance.now();
   let waterAccum = 0;
+  let lavaAccum = 0;
 
   let fpsFrames = 0;
   let fpsWindowStart = performance.now();
@@ -620,6 +624,13 @@
       if (!world.isWaterSettled()) {
         world.stepWater();
       }
+    }
+
+    // 溶岩ステップ（水の約1/4の速度でねっとりゆっくり流れる）
+    lavaAccum += dt;
+    if (lavaAccum >= 0.34) {
+      lavaAccum = 0;
+      world.stepLava();
     }
 
     glRenderer.render(world, player, camera, settings, now * 0.001);

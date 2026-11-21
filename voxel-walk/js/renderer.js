@@ -644,7 +644,8 @@
         }
       }
 
-      // 3. 水スライス評価（昼夜＆松明・溶岩の光も反映！）
+      // 3. 水・流動溶岩スライス評価（昼夜＆松明・溶岩の光も反映！）
+      bool isFluidLava = (flags & 4) != 0 && !curSolid;
       bool isSurface = false;
       int surfBz = bz;
       if (lz > 0 && bz < uWorldZ && visLevel == lz) {
@@ -654,10 +655,27 @@
         if ((belowW.x & 15) == 8) {
           isSurface = true;
           surfBz = bz - 1;
+          if ((belowW.y & 4) != 0 && (belowW.y & 2) == 0) {
+            isFluidLava = true;
+          }
         }
       }
 
       if (isSurface) {
+        if (isFluidLava) {
+          // ゆっくりうねる自己発光の粘性マグマ表面（岸辺はわずかに冷えた暗紅の殻）
+          vec3 lRgb = lavaColor(vBlockPos, uTime * 0.55) * 1.12;
+          vec2 fxy = fract(vBlockPos);
+          float crust = 0.0;
+          if (fxy.x < 0.16 && (sampleWaterCell(bxy + ivec2(-1, 0), surfBz).y & 2) != 0) crust = max(crust, 1.0 - fxy.x / 0.16);
+          if (fxy.x > 0.84 && (sampleWaterCell(bxy + ivec2(1, 0), surfBz).y & 2) != 0) crust = max(crust, (fxy.x - 0.84) / 0.16);
+          if (fxy.y < 0.16 && (sampleWaterCell(bxy + ivec2(0, -1), surfBz).y & 2) != 0) crust = max(crust, 1.0 - fxy.y / 0.16);
+          if (fxy.y > 0.84 && (sampleWaterCell(bxy + ivec2(0, 1), surfBz).y & 2) != 0) crust = max(crust, (fxy.y - 0.84) / 0.16);
+          lRgb = mix(lRgb, vec3(0.42, 0.08, 0.02), crust * 0.55);
+          outColor = vec4(lRgb, 1.0);
+          return;
+        }
+
         vec2 wc = waterCaustic(vBlockPos, uTime);
         float webSharp = wc.x;
         float cellEdge = wc.y;
@@ -704,6 +722,22 @@
       }
 
       if (bz < uWorldZ && visLevel >= lz + 1) {
+        if (isFluidLava) {
+          if (isFalling) {
+            // 崖をゆっくりねっとり垂れ落ちる自己発光のマグマの滝！
+            vec2 wp = floor(vBlockPos * 6.0) / 6.0;
+            float zPos = float(vSliceZ) * 0.125;
+            float hCoord = wp.x * 0.78 + wp.y * 0.62;
+            float flowN = cloudNoise(vec2(hCoord * 3.8, zPos * 0.65 + uTime * 1.15));
+            float hotCore = smoothstep(0.32, 0.82, flowN);
+            vec3 lavaFallCol = mix(vec3(0.58, 0.11, 0.02), vec3(1.0, 0.52, 0.08), hotCore);
+            lavaFallCol = mix(lavaFallCol, vec3(1.0, 0.90, 0.38), smoothstep(0.68, 0.95, flowN) * 0.75);
+            outColor = vec4(lavaFallCol, 0.96);
+          } else {
+            outColor = vec4(lavaColor(vBlockPos, uTime * 0.55) * 0.92, 1.0);
+          }
+          return;
+        }
         vec3 lightCol = evalWorldLight(vBlockPos, vSliceZ);
         if (isFalling) {
           // 多層スクロールノイズによるリアルな滝（縦に伸びた水流の筋＋飛沫＋滝壺の白泡）

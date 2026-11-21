@@ -104,9 +104,14 @@
   function createWorld(seedInput) {
     const seed = seedInput !== undefined ? seedInput : 104729;
     const cellCount = WORLD_X * WORLD_Y * WORLD_Z;
+    const LAVA_MAX = 64;
+    const LAVA_PER_LEVEL = 8;
     const blocks = new Uint8Array(cellCount);
     const water = new Uint8Array(cellCount);
     const falling = new Uint8Array(cellCount);
+    const lava = new Uint8Array(cellCount);        // 0..64 粘性の高い流動溶岩（明るさ15）
+    const lavaFalling = new Uint8Array(cellCount); // 崖をゆっくり垂れ落ちる溶岩フラグ
+    const layerHasLava = new Uint8Array(WORLD_Z);
     const streamWet = new Uint8Array(cellCount);  // 流れる小川が途切れず繋がるための残像タイマー
     const streamFall = new Uint8Array(cellCount); // 段差を落ちる滝・小川カーテンの残像タイマー
     const trailActive = new Uint8Array(cellCount);
@@ -456,11 +461,12 @@
     }
 
     // ============================================================
-    // 2.5. 溶岩だまり（明るさ15の自然光源）を数カ所生成（洞窟内＋岩山の火口・谷）
+    // 2.5. 溶岩だまり（明るさ15・ゆっくり流れる粘性流体）を数カ所生成
     // ============================================================
     const lavaPools = [];
+    const lavaVents = [];
 
-    function placeLavaPool(cx, cy, zLevel, radiusX, radiusY, openSky) {
+    function placeLavaPool(cx, cy, zLevel, radiusX, radiusY, openSky, notchDir) {
       let count = 0;
       const rxI = Math.ceil(radiusX) + 1;
       const ryI = Math.ceil(radiusY) + 1;
@@ -472,9 +478,11 @@
           const norm = (dx * dx) / (radiusX * radiusX) + (dy * dy) / (radiusY * radiusY);
           const jitter = (hash3(lx, ly, seed + 555) - 0.5) * 0.35;
           if (norm + jitter <= 1.0) {
-            // 溶岩の底は深岩で支える
+            // 溶岩の底は深岩で支え、溶岩自体は空気セル上の粘性流体 (lava[] = 64) として満たす
             if (zLevel > 0) setBlock(lx, ly, zLevel - 1, BLOCK_DARK_STONE);
-            setBlock(lx, ly, zLevel, BLOCK_LAVA);
+            setBlock(lx, ly, zLevel, BLOCK_AIR);
+            lava[index(lx, ly, zLevel)] = LAVA_MAX;
+            layerHasLava[zLevel] = 1;
             // 溶岩の直上を空けて光とマグマ模様が見えるようにする
             const clearTop = openSky ? WORLD_Z - 1 : Math.min(WORLD_Z - 2, zLevel + 2);
             for (let cz = zLevel + 1; cz <= clearTop; cz++) {
@@ -482,39 +490,56 @@
             }
             count++;
           } else if (norm <= 1.65) {
-            // 溶岩だまりの縁を深岩の岩縁にして水と混ざりにくくする
-            if (getBlock(lx, ly, zLevel) === BLOCK_AIR || getBlock(lx, ly, zLevel) === BLOCK_GRASS) {
+            // 溶岩だまりの縁を深岩の岩縁にして囲む（クリックで縁を壊すとゆっくり溶岩が流れ出す！）
+            const isNotch =
+              notchDir &&
+              Math.sign(dx) === notchDir[0] &&
+              Math.sign(dy) === notchDir[1] &&
+              Math.abs(dx * notchDir[1] - dy * notchDir[0]) <= 0;
+            if (isNotch) {
+              if (zLevel > 0) setBlock(lx, ly, zLevel - 1, BLOCK_DARK_STONE);
+              setBlock(lx, ly, zLevel, BLOCK_AIR);
+              const clearTop = openSky ? WORLD_Z - 1 : Math.min(WORLD_Z - 2, zLevel + 2);
+              for (let cz = zLevel + 1; cz <= clearTop; cz++) {
+                setBlock(lx, ly, cz, BLOCK_AIR);
+              }
+            } else if (getBlock(lx, ly, zLevel) === BLOCK_AIR || getBlock(lx, ly, zLevel) === BLOCK_GRASS) {
               setBlock(lx, ly, zLevel, BLOCK_DARK_STONE);
             }
           }
         }
       }
-      if (count > 0) lavaPools.push({ x: cx, y: cy, z: zLevel, blocks: count });
+      if (count > 0) {
+        lavaPools.push({ x: cx, y: cy, z: zLevel, blocks: count });
+        if (notchDir) {
+          lavaVents.push({ x: cx, y: cy, z: zLevel });
+        }
+      }
     }
 
     // ① ランドマーク・スパゲッティ洞窟の奥（歩いていくと赤い溶岩の光が見えてくる！）
-    placeLavaPool(84, 71, 2, 2.2, 1.8, false);
-    // ② スタート北東の岩山火口・峡谷（夜になると遠くからでも赤く輝く！）
-    placeLavaPool(90, 56, 5, 2.6, 2.2, true);
+    placeLavaPool(84, 71, 2, 2.2, 1.8, false, null);
+    // ② スタート北東の岩山火口（切れ目からゆっくり溶岩が流れ出す！）
+    placeLavaPool(90, 56, 6, 2.4, 2.0, true, [-1, 0]);
     // ③ さらにマップ内の岩山・地下洞窟に 5カ所の溶岩だまりを点在させる
     const lavaCandidates = [
-      { x: 102, y: 84, r: 2.5, open: true },
-      { x: 96, y: 32, r: 2.3, open: true },
-      { x: 74, y: 98, r: 2.2, open: true },
-      { x: 42, y: 38, r: 2.1, open: false }, // 地下スパゲッティ洞窟の溶岩だまり
-      { x: 34, y: 92, r: 2.4, open: true },
+      { x: 102, y: 84, r: 2.4, open: true, notch: [0, -1] },
+      { x: 96, y: 32, r: 2.3, open: true, notch: null },
+      { x: 74, y: 98, r: 2.2, open: true, notch: null },
+      { x: 42, y: 38, r: 2.1, open: false, notch: null }, // 地下スパゲッティ洞窟の溶岩だまり
+      { x: 34, y: 92, r: 2.4, open: true, notch: null },
     ];
     for (const cand of lavaCandidates) {
       let zPick = 2;
       if (cand.open) {
         for (let z = WORLD_Z - 2; z >= 2; z--) {
           if (getBlock(cand.x, cand.y, z) !== BLOCK_AIR) {
-            zPick = Math.max(2, Math.min(6, z));
+            zPick = Math.max(2, Math.min(7, z));
             break;
           }
         }
       }
-      placeLavaPool(cand.x, cand.y, zPick, cand.r, cand.r * 0.85, cand.open);
+      placeLavaPool(cand.x, cand.y, zPick, cand.r, cand.r * 0.85, cand.open, cand.notch);
     }
 
     // 3. 露出している土ブロックの上面を草ブロックへ変換し、surfaceHeight と solidBlockCount を確定
@@ -1101,13 +1126,20 @@
       }
       terrainTexVersion++;
 
-      // 水流テクスチャ・落下距離マップを更新し、周囲の水をすぐ新しい穴へ流し込む
+      // 水流・溶岩テクスチャと落下距離マップを更新し、周囲の水・溶岩をすぐ新しい穴へ流し込む
       markBlockWaterDirty(bz);
       if (bz > 0) markBlockWaterDirty(bz - 1);
       if (bz + 1 < WORLD_Z) markBlockWaterDirty(bz + 1);
       layerHasWater[bz] = 1;
-      if (bz > 0) layerHasWater[bz - 1] = 1;
-      if (bz + 1 < WORLD_Z) layerHasWater[bz + 1] = 1;
+      layerHasLava[bz] = 1;
+      if (bz > 0) {
+        layerHasWater[bz - 1] = 1;
+        layerHasLava[bz - 1] = 1;
+      }
+      if (bz + 1 < WORLD_Z) {
+        layerHasWater[bz + 1] = 1;
+        layerHasLava[bz + 1] = 1;
+      }
       waterSettled = false;
       calmStreak = 0;
       recomputeTorchSmokeMask();
@@ -1306,9 +1338,9 @@
       let qHead = 0;
       let qTail = 0;
 
-      // 1. すべての光源（松明 = 15、溶岩ブロック = 15）をシード登録
+      // 1. すべての光源（松明 = 15、溶岩 = 15）をシード登録
       for (let i = 0; i < cellCount; i++) {
-        if (torches[i] || blocks[i] === BLOCK_LAVA) {
+        if (torches[i] || blocks[i] === BLOCK_LAVA || lava[i] > 0) {
           blockLight[i] = 15;
           lightQueue[qTail++] = i;
         }
@@ -1368,7 +1400,7 @@
             let bL = blockLight[i];
             let sL = skyLight[i];
 
-            if (b === BLOCK_LAVA) {
+            if (b === BLOCK_LAVA || lava[i] > 0) {
               bL = 15;
               sL = 15;
             } else if (b !== BLOCK_AIR) {
@@ -1492,6 +1524,12 @@
       return { block: blockLight[i], sky: skyLight[i] };
     }
 
+    function lavaToVisualLevel(units) {
+      if (units <= 0) return 0;
+      const lv = Math.ceil(units / LAVA_PER_LEVEL);
+      return lv > 8 ? 8 : lv;
+    }
+
     function rebuildDirtyWaterSlices() {
       let anyUpdated = false;
       const layerStride = WORLD_X * WORLD_Y;
@@ -1504,38 +1542,49 @@
           const b = blocks[idx];
           let visLevel = waterToVisualLevel(water[idx]);
           let isFall = 0;
+          let isLavaCell = b === BLOCK_LAVA;
 
           if (b === BLOCK_AIR) {
-            const hasFall = falling[idx] !== 0 || streamFall[idx] > 0;
-            if (hasFall) {
-              isFall = 1;
-              // 真上も落下中なら8スライス満タンの滝カーテン、落ち口（段差の上端）なら小川と同じ高さ2で滑らかに接続！
-              const aboveFalling =
-                bz + 1 < WORLD_Z &&
-                (falling[idx + layerStride] !== 0 || streamFall[idx + layerStride] > 0);
-              if (aboveFalling) {
-                visLevel = Math.max(visLevel, 8);
-              } else {
-                visLevel = Math.max(visLevel, 2);
+            if (lava[idx] > 0 || lavaFalling[idx] !== 0) {
+              isLavaCell = true;
+              visLevel = lavaToVisualLevel(lava[idx]);
+              if (lavaFalling[idx] !== 0) {
+                isFall = 1;
+                const aboveLavaFall = bz + 1 < WORLD_Z && lavaFalling[idx + layerStride] !== 0;
+                visLevel = Math.max(visLevel, aboveLavaFall ? 8 : 3);
               }
-            } else if (streamWet[idx] > 0) {
-              // 流れる小川が飛び飛びにならないよう、直近で水が通った床面を連続した浅瀬として維持
-              const hasSupport =
-                bz === 0 ||
-                blocks[idx - layerStride] !== BLOCK_AIR ||
-                water[idx - layerStride] > 0 ||
-                streamFall[idx - layerStride] > 0;
-              if (hasSupport) {
-                visLevel = Math.max(visLevel, 2);
+            } else {
+              const hasFall = falling[idx] !== 0 || streamFall[idx] > 0;
+              if (hasFall) {
+                isFall = 1;
+                // 真上も落下中なら8スライス満タンの滝カーテン、落ち口（段差の上端）なら小川と同じ高さ2で滑らかに接続！
+                const aboveFalling =
+                  bz + 1 < WORLD_Z &&
+                  (falling[idx + layerStride] !== 0 || streamFall[idx + layerStride] > 0);
+                if (aboveFalling) {
+                  visLevel = Math.max(visLevel, 8);
+                } else {
+                  visLevel = Math.max(visLevel, 2);
+                }
+              } else if (streamWet[idx] > 0) {
+                // 流れる小川が飛び飛びにならないよう、直近で水が通った床面を連続した浅瀬として維持
+                const hasSupport =
+                  bz === 0 ||
+                  blocks[idx - layerStride] !== BLOCK_AIR ||
+                  water[idx - layerStride] > 0 ||
+                  streamFall[idx - layerStride] > 0;
+                if (hasSupport) {
+                  visLevel = Math.max(visLevel, 2);
+                }
               }
             }
           }
 
-          // Gチャンネルフラグ: bit0=滝落下, bit1=固体, bit2=溶岩, bit3=松明, bit4=木(幹/葉), bit5=葉, bit6-7=草花
+          // Gチャンネルフラグ: bit0=落下, bit1=固体, bit2=溶岩, bit3=松明, bit4=木(幹/葉), bit5=葉, bit6-7=草花
           const flags =
             isFall |
             (b !== BLOCK_AIR ? 2 : 0) |
-            (b === BLOCK_LAVA ? 4 : 0) |
+            (isLavaCell ? 4 : 0) |
             (torches[idx] ? 8 : 0) |
             (b === BLOCK_WOOD || b === BLOCK_LEAVES ? 16 : 0) |
             (b === BLOCK_LEAVES ? 32 : 0) |
@@ -1618,7 +1667,7 @@
             const sp = highSpots[(k + pass * 11) % highSpots.length];
             const z = Math.min(WORLD_Z - 1, sp.z + Math.floor(pass / 5));
             const i = index(sp.x, sp.y, z);
-            if (blocks[i] === BLOCK_AIR && water[i] < WATER_MAX) {
+            if (blocks[i] === BLOCK_AIR && lava[i] === 0 && water[i] < WATER_MAX) {
               const add = Math.min(WATER_MAX - water[i], targetUnits - placed, 32);
               water[i] += add;
               layerHasWater[z] = 1;
@@ -1777,7 +1826,7 @@
             if (w === 0) continue;
 
             const below = index(x, y, z - 1);
-            if (blocks[below] === BLOCK_AIR && water[below] < WATER_MAX) {
+            if (blocks[below] === BLOCK_AIR && lava[below] === 0 && water[below] < WATER_MAX) {
               const fall = Math.min(w, WATER_MAX - water[below]);
               transfer(i, below, fall, z, z - 1);
               falling[below] = 1;
@@ -1824,7 +1873,7 @@
                 const ny = y + dir[1];
                 if (nx < 0 || nx >= WORLD_X || ny < 0 || ny >= WORLD_Y) continue;
                 const ni = index(nx, ny, z);
-                if (blocks[ni] !== BLOCK_AIR || water[ni] >= WATER_MAX) continue;
+                if (blocks[ni] !== BLOCK_AIR || lava[ni] > 0 || water[ni] >= WATER_MAX) continue;
 
                 const nd = distToDrop[ni];
                 if (nd >= curDist) continue;
@@ -1862,7 +1911,7 @@
               const ny = y + dir[1];
               if (nx < 0 || nx >= WORLD_X || ny < 0 || ny >= WORLD_Y) continue;
               const ni = index(nx, ny, z);
-              if (blocks[ni] !== BLOCK_AIR) continue;
+              if (blocks[ni] !== BLOCK_AIR || lava[ni] > 0) continue;
               if (curDist > 0 && curDist < 255 && distToDrop[ni] > curDist) continue;
               if (water[ni] <= w - 3) {
                 basinBuf[bCount++] = ni;
@@ -1963,6 +2012,235 @@
       return totalMoved > 0;
     }
 
+    // ============================================================
+    // 7.5 粘性の高い溶岩のゆっくり流動シミュレーション（水の約1/4速度）
+    // ============================================================
+    let lavaTick = 0;
+
+    function stepLava() {
+      lavaTick++;
+      let visualChanged = false;
+      let lightDirty = false;
+      let totalMoved = 0;
+
+      // 落下フラグを緩やかに更新
+      for (let z = 0; z < WORLD_Z; z++) {
+        if (!layerHasLava[z]) continue;
+        const base = z * WORLD_Y * WORLD_X;
+        for (let p = 0; p < WORLD_X * WORLD_Y; p++) {
+          if (lavaFalling[base + p] > 0) {
+            lavaFalling[base + p]--;
+            if (lavaFalling[base + p] === 0) {
+              visualChanged = true;
+              markBlockWaterDirty(z);
+            }
+          }
+        }
+      }
+
+      // 溶岩総量を数え、上限未満なら火口ベントからごく少しずつ補給して溶岩流が途切れないようにする
+      let totalLavaUnits = 0;
+      for (let z = 0; z < WORLD_Z; z++) {
+        if (!layerHasLava[z]) continue;
+        const base = z * WORLD_Y * WORLD_X;
+        for (let p = 0; p < WORLD_X * WORLD_Y; p++) {
+          totalLavaUnits += lava[base + p];
+        }
+      }
+      if (totalLavaUnits < 6800) {
+        for (let v = 0; v < lavaVents.length; v++) {
+          const vt = lavaVents[v];
+          const vi = index(vt.x, vt.y, vt.z);
+          if (blocks[vi] === BLOCK_AIR && water[vi] === 0 && lava[vi] < LAVA_MAX) {
+            const prevLv = lavaToVisualLevel(lava[vi]);
+            const wasZero = lava[vi] === 0;
+            lava[vi] = Math.min(LAVA_MAX, lava[vi] + 3);
+            layerHasLava[vt.z] = 1;
+            if (wasZero) lightDirty = true;
+            if (lavaToVisualLevel(lava[vi]) !== prevLv) {
+              visualChanged = true;
+              markBlockWaterDirty(vt.z);
+            }
+          }
+        }
+      }
+
+      const xStart = lavaTick & 1 ? 0 : WORLD_X - 1;
+      const xEnd = lavaTick & 1 ? WORLD_X : -1;
+      const xStep = lavaTick & 1 ? 1 : -1;
+      const yStart = lavaTick & 2 ? 0 : WORLD_Y - 1;
+      const yEnd = lavaTick & 2 ? WORLD_Y : -1;
+      const yStep = lavaTick & 2 ? 1 : -1;
+
+      function transferLava(srcIdx, dstIdx, amount, srcZ, dstZ) {
+        if (amount <= 0) return;
+        const prevSrcLv = lavaToVisualLevel(lava[srcIdx]);
+        const prevDstLv = lavaToVisualLevel(lava[dstIdx]);
+        const dstWasZero = lava[dstIdx] === 0;
+        lava[srcIdx] -= amount;
+        lava[dstIdx] += amount;
+        totalMoved += amount;
+        layerHasLava[dstZ] = 1;
+        if (foliage[dstIdx] !== 0) foliage[dstIdx] = 0;
+
+        const srcNowZero = lava[srcIdx] === 0;
+        if (dstWasZero || srcNowZero) lightDirty = true;
+
+        if (dstZ < srcZ) {
+          lavaFalling[srcIdx] = 3;
+          lavaFalling[dstIdx] = 3;
+          visualChanged = true;
+          markBlockWaterDirty(srcZ);
+          markBlockWaterDirty(dstZ);
+        } else if (lavaToVisualLevel(lava[srcIdx]) !== prevSrcLv || lavaToVisualLevel(lava[dstIdx]) !== prevDstLv) {
+          visualChanged = true;
+          markBlockWaterDirty(srcZ);
+          if (dstZ !== srcZ) markBlockWaterDirty(dstZ);
+        }
+      }
+
+      // 1. 重力によるゆっくりとした落下（ねっとり重く垂れ落ちる）
+      for (let z = 1; z < WORLD_Z; z++) {
+        if (!layerHasLava[z]) continue;
+        for (let y = yStart; y !== yEnd; y += yStep) {
+          for (let x = xStart; x !== xEnd; x += xStep) {
+            const i = index(x, y, z);
+            const lv = lava[i];
+            if (lv === 0) continue;
+            const below = index(x, y, z - 1);
+            if (blocks[below] === BLOCK_AIR && water[below] === 0 && lava[below] < LAVA_MAX) {
+              const drop = Math.min(lv, 18, LAVA_MAX - lava[below]);
+              transferLava(i, below, drop, z, z - 1);
+            }
+          }
+        }
+      }
+
+      // 2. 水平方向への粘性流動（水より厚みを保ちながら坂や穴へじわじわ広がる）
+      const dirStart = lavaTick & 3;
+      for (let z = 0; z < WORLD_Z; z++) {
+        if (!layerHasLava[z]) continue;
+        let anyLava = 0;
+        for (let y = yStart; y !== yEnd; y += yStep) {
+          for (let x = xStart; x !== xEnd; x += xStep) {
+            const i = index(x, y, z);
+            let lv = lava[i];
+            if (lv === 0) continue;
+            anyLava = 1;
+
+            if (z > 0) {
+              const below = index(x, y, z - 1);
+              if (blocks[below] === BLOCK_AIR && water[below] === 0 && lava[below] < LAVA_MAX) {
+                lavaFalling[i] = 3;
+                continue;
+              }
+            }
+
+            // まず直近の下り段差・崖方向へじわじわ這い進む
+            const curDist = distToDrop[i];
+            let flowedDown = false;
+            if (curDist > 0 && curDist < 255) {
+              let bestIdx = -1;
+              let bestDist = curDist;
+              for (let d = 0; d < 4; d++) {
+                const dir = DIRS[(dirStart + d) & 3];
+                const nx = x + dir[0];
+                const ny = y + dir[1];
+                if (nx < 0 || nx >= WORLD_X || ny < 0 || ny >= WORLD_Y) continue;
+                const ni = index(nx, ny, z);
+                if (blocks[ni] !== BLOCK_AIR || water[ni] > 0 || lava[ni] >= LAVA_MAX) continue;
+                const nd = distToDrop[ni];
+                if (nd < bestDist) {
+                  bestDist = nd;
+                  bestIdx = ni;
+                }
+              }
+              if (bestIdx !== -1) {
+                const want = lv <= 4 ? lv : Math.max(2, Math.min(10, Math.ceil(lv * 0.34)));
+                const flow = Math.min(lv, LAVA_MAX - lava[bestIdx], want);
+                if (flow > 0) {
+                  transferLava(i, bestIdx, flow, z, z);
+                  flowedDown = true;
+                }
+              }
+            }
+            if (flowedDown) continue;
+
+            // 平坦な場所では粘性のある厚み（段差 8単位以上）を保ちつつゆっくり拡散
+            let minIdx = -1;
+            let minLv = lv;
+            for (let d = 0; d < 4; d++) {
+              const dir = DIRS[(dirStart + d) & 3];
+              const nx = x + dir[0];
+              const ny = y + dir[1];
+              if (nx < 0 || nx >= WORLD_X || ny < 0 || ny >= WORLD_Y) continue;
+              const ni = index(nx, ny, z);
+              if (blocks[ni] !== BLOCK_AIR || water[ni] > 0) continue;
+              if (lava[ni] <= lv - 8 && lava[ni] < minLv) {
+                minLv = lava[ni];
+                minIdx = ni;
+              }
+            }
+            if (minIdx !== -1) {
+              const flow = Math.max(1, Math.min(8, Math.floor((lv - minLv) * 0.32)));
+              transferLava(i, minIdx, flow, z, z);
+            }
+          }
+        }
+        layerHasLava[z] = anyLava;
+      }
+
+      // マップ最外周に到達した溶岩は自然に外へ排出
+      for (let z = 0; z < WORLD_Z; z++) {
+        if (!layerHasLava[z]) continue;
+        for (let x = 0; x < WORLD_X; x++) {
+          for (const ey of [0, WORLD_Y - 1]) {
+            const iEdge = index(x, ey, z);
+            if (lava[iEdge] > 0) {
+              const pv = lavaToVisualLevel(lava[iEdge]);
+              lava[iEdge] = Math.max(0, lava[iEdge] - 2);
+              if (lava[iEdge] === 0) lightDirty = true;
+              if (lavaToVisualLevel(lava[iEdge]) !== pv) {
+                visualChanged = true;
+                markBlockWaterDirty(z);
+              }
+            }
+          }
+        }
+        for (let y = 1; y < WORLD_Y - 1; y++) {
+          for (const ex of [0, WORLD_X - 1]) {
+            const iEdge = index(ex, y, z);
+            if (lava[iEdge] > 0) {
+              const pv = lavaToVisualLevel(lava[iEdge]);
+              lava[iEdge] = Math.max(0, lava[iEdge] - 2);
+              if (lava[iEdge] === 0) lightDirty = true;
+              if (lavaToVisualLevel(lava[iEdge]) !== pv) {
+                visualChanged = true;
+                markBlockWaterDirty(z);
+              }
+            }
+          }
+        }
+      }
+
+      if (visualChanged) {
+        rebuildDirtyWaterSlices();
+      }
+      if (lightDirty) {
+        recomputeBlockLight();
+        packLightTexture();
+      }
+      return totalMoved > 0;
+    }
+
+    function getLavaLevelAt(wx, wy, wz) {
+      const bx = Math.floor(wx);
+      const by = Math.floor(wy);
+      const bz = Math.floor(wz);
+      if (!inBounds(bx, by, bz)) return 0;
+      return lavaToVisualLevel(lava[index(bx, by, bz)]);
+    }
+
     function computeCurrentTotalWater() {
       let sum = 0;
       for (let i = 0; i < cellCount; i++) {
@@ -2018,7 +2296,7 @@
         if (z >= WORLD_Z) continue;
         if (getBlock(x, y, topZ) !== BLOCK_GRASS) continue;
         const i = index(x, y, z);
-        if (blocks[i] !== BLOCK_AIR || torches[i] || water[i] > 0) continue;
+        if (blocks[i] !== BLOCK_AIR || torches[i] || water[i] > 0 || lava[i] > 0) continue;
         // プレイヤーの初期スポーン地点直下だけ空ける
         if (x === 60 && y === 64) continue;
 
@@ -2172,7 +2450,8 @@
           const aheadX = Math.floor(s.x + Math.cos(s.facing) * 0.85);
           const aheadY = Math.floor(s.y + Math.sin(s.facing) * 0.85);
           const aheadFloor = findFloorBelow(aheadX + 0.5, aheadY + 0.5, s.z + 0.5);
-          const dangerous = aheadFloor.blockType === BLOCK_LAVA || s.z - aheadFloor.floorZ > 2.2;
+          const aheadLava = getLavaLevelAt(aheadX + 0.5, aheadY + 0.5, aheadFloor.floorZ + 0.2) > 0;
+          const dangerous = aheadFloor.blockType === BLOCK_LAVA || aheadLava || s.z - aheadFloor.floorZ > 2.2;
 
           if (dangerous) {
             s.targetFacing = s.facing + Math.PI * (0.7 + Math.random() * 0.6);
@@ -2302,8 +2581,10 @@
       getTorchCount: () => torchCount,
       getLightAt,
       stepWater,
+      stepLava,
       resetWaterToHighlands,
       getWaterLevelAt,
+      getLavaLevelAt,
       isWaterSettled: () => waterSettled,
       getInitialTotalWater: () => totalWaterUnits,
       computeCurrentTotalWater,
