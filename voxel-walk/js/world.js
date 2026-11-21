@@ -113,6 +113,7 @@
     const trailList = new Int32Array(cellCount);
     let trailCount = 0;
     const torches = new Uint8Array(cellCount); // 1 = 松明が置かれている（明るさ15）
+    const smokeNear = new Uint8Array(cellCount); // 1 = 松明の煙が届く近傍マス（GPU高速スキップ用）
     const foliage = new Uint8Array(cellCount); // 0=なし, 1=短い雑草, 2=背の高い雑草, 3=花
     const skyLight = new Uint8Array(cellCount); // 0..15（太陽光）
     const blockLight = new Uint8Array(cellCount); // 0..15（松明・溶岩の光、15ブロック＝半径16マス伝播）
@@ -1109,6 +1110,7 @@
       if (bz + 1 < WORLD_Z) layerHasWater[bz + 1] = 1;
       waterSettled = false;
       calmStreak = 0;
+      recomputeTorchSmokeMask();
       recomputeActiveDrops();
       rebuildDirtyWaterSlices();
 
@@ -1413,6 +1415,31 @@
       lightTexVersion++;
     }
 
+    function recomputeTorchSmokeMask() {
+      smokeNear.fill(0);
+      for (let tz = 0; tz < WORLD_Z; tz++) {
+        const zOff = tz * WORLD_Y * WORLD_X;
+        for (let ty = 0; ty < WORLD_Y; ty++) {
+          const rowOff = zOff + ty * WORLD_X;
+          for (let tx = 0; tx < WORLD_X; tx++) {
+            if (!torches[rowOff + tx]) continue;
+            const blockedAbove = tz + 1 < WORLD_Z && blocks[index(tx, ty, tz + 1)] !== BLOCK_AIR;
+            const maxDz = blockedAbove ? 1 : 3;
+            for (let dz = 1; dz <= maxDz; dz++) {
+              const sz = tz + dz;
+              if (sz >= WORLD_Z) break;
+              for (let dx = 0; dx <= 3; dx++) {
+                const sx = tx - dx;
+                if (sx < 0) break;
+                smokeNear[index(sx, ty, sz)] = 1;
+              }
+              markBlockWaterDirty(sz);
+            }
+          }
+        }
+      }
+    }
+
     function placeTorchAt(wx, wy, wz) {
       const bx = Math.floor(wx);
       const by = Math.floor(wy);
@@ -1423,6 +1450,7 @@
       torches[i] = 1;
       foliage[i] = 0;
       torchCount++;
+      recomputeTorchSmokeMask();
       markBlockWaterDirty(bz);
       rebuildDirtyWaterSlices();
       recomputeBlockLight();
@@ -1443,7 +1471,8 @@
             if (torches[i]) {
               torches[i] = 0;
               torchCount--;
-              markBlockWaterDirty(bz);
+              for (let k = 0; k <= 3; k++) markBlockWaterDirty(bz + k);
+              recomputeTorchSmokeMask();
               rebuildDirtyWaterSlices();
               recomputeBlockLight();
               packLightTexture();
@@ -1511,7 +1540,8 @@
             (b === BLOCK_WOOD || b === BLOCK_LEAVES ? 16 : 0) |
             (b === BLOCK_LEAVES ? 32 : 0) |
             ((foliage[idx] & 3) << 6);
-          out[p * 2] = visLevel;
+          // Rチャンネル: bit0-3=visLevel(0..8), bit7=松明煙近傍フラグ
+          out[p * 2] = (visLevel & 15) | (smokeNear[idx] ? 128 : 0);
           out[p * 2 + 1] = flags;
         }
         anyUpdated = true;
@@ -2011,6 +2041,7 @@
     }
 
     dirtyWaterLayers.fill(1);
+    recomputeTorchSmokeMask();
     rebuildDirtyWaterSlices();
     recomputeSkyLight();
     recomputeBlockLight();

@@ -62,9 +62,10 @@
     precision highp sampler3D;
 
     uniform sampler2DArray uTerrainTex; // 768x768 x N slices (RGBA8)
-    uniform sampler2DArray uWaterTex;   // 128x128 x 14 layers (RG8: R=visLevel 0..8, G=flags: 1=fall, 2=solid, 4=lava, 8=torch, 16=tree, 32=leaves, 64-128=foliage)
+    uniform sampler2DArray uWaterTex;   // 128x128 x 14 layers (RG8: R=visLevel(0..8)|smokeBit128, G=flags)
     uniform sampler3D uLightTex;        // 128x128 x 14 (RG8, LINEAR: R=blockLight, G=skyLight)
     uniform sampler2D uTreeSwayTex;     // 128x128 (RGBA8, NEAREST: RG=swayXY, B=(baseBz<<4)|heightBlocks, A=hitEnergy)
+    uniform sampler2D uCloudTex;        // 128x128 (R8, LINEAR, REPEAT: 事前ベイク済み積雲密度)
     uniform vec2 uYawCS;                // 隣接する葉ブロック重なり時の前後ソート用
 
     uniform vec2 uWorldSize;
@@ -152,17 +153,11 @@
       return ivec2(int(floor(rg.r * 255.0 + 0.5)), int(floor(rg.g * 255.0 + 0.5)));
     }
 
-    // 雲シェーダーと共有する積雲フィールド（東+Xから西-Xへ流れるもこもこ雲の塊）
+    // 滝・水流用の軽量値ノイズ（雲は事前ベイクテクスチャ uCloudTex で1回フェッチに高速化済み！）
     float cloudHash(vec2 p) {
       p = fract(p * vec2(123.34, 456.21));
       p += dot(p, p + 45.32);
       return fract(p.x * p.y);
-    }
-
-    vec2 cloudHash2(vec2 p) {
-      vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
-      p3 += dot(p3, p3.yzx + 33.33);
-      return fract((p3.xx + p3.yz) * p3.zy);
     }
 
     float cloudNoise(vec2 p) {
@@ -176,37 +171,7 @@
       );
     }
 
-    // 丸い泡が重なり合う「もこもこ」積雲ドームの高さ (0..1)
-    float cloudPuffDomes(vec2 p) {
-      vec2 gp = p * 0.135;
-      vec2 ip = floor(gp);
-      vec2 fp = fract(gp);
-      float best = 0.0;
-      for (int j = -1; j <= 1; j++) {
-        for (int i = -1; i <= 1; i++) {
-          vec2 cell = ip + vec2(float(i), float(j));
-          vec2 h = cloudHash2(cell + vec2(4.7, 9.1));
-          vec2 center = vec2(float(i), float(j)) + 0.18 + h * 0.64;
-          float r = 0.62 + h.x * 0.36;
-          float d = length(fp - center) / r;
-          float dome = clamp(1.0 - d * d, 0.0, 1.0);
-          best = max(best, dome);
-        }
-      }
-      return sqrt(best);
-    }
-
-    // 雲の高さ・密度マップ (0=快晴, >0.52=雲本体、高いほどもこもこ盛り上がる)
-    float cloudField(vec2 p) {
-      float base =
-        cloudNoise(p * vec2(0.038, 0.050) + vec2(3.1, 7.4)) * 0.72 +
-        cloudNoise(p * vec2(0.082, 0.096) + vec2(11.7, 2.9)) * 0.28;
-      if (base < 0.36) return 0.0;
-      float puffs = cloudPuffDomes(p);
-      return base * 0.68 + puffs * 0.42;
-    }
-
-    // 3D ライトマップから滑らかな総合照明カラー（太陽光＋雲の影＋16ブロック到達の光源光）を計算
+    // 3D ライトマップから滑らかな総合照明カラー（太陽光＋事前ベイク雲の影＋16ブロック到達の光源光）を計算
     vec3 evalWorldLight(vec2 blockPos, int sliceZ) {
       vec3 luv = vec3(
         blockPos.x / uWorldSize.x,
@@ -215,24 +180,22 @@
       );
       vec2 ls = texture(uLightTex, luv).rg; // r = blockLight (0..1), g = skyLight (0..1)
 
-      // Minecraft 風の知覚カーブ（0で完全に暗く、15でしっかり明るい）
       float bL = pow(ls.r, 1.55);
       float sL = pow(ls.g, 1.35) * uSunBrightness;
 
-      // 松明・溶岩の暖色光にわずかな炎のゆらぎを足す
       float flicker = 0.965 + 0.035 * sin(uTime * 6.8 + blockPos.x * 1.3 + blockPos.y * 1.7);
       vec3 blockCol = vec3(1.12, 0.78, 0.42) * bL * flicker;
       vec3 skyCol = uSkyLightColor * sL;
 
-      // 高さ20を東→西へ流れるもこもこ雲が落とす柔らかな青み影（太陽光のみに作用し、洞窟や松明光は遮らない）
+      // 事前ベイク済み uCloudTex を1回サンプルするだけで滑らかな雲の影を適用（超高速！）
       if (uCloudsEnabled == 1 && sL > 0.01) {
         float dh = max(0.0, 20.0 - float(sliceZ) * 0.125);
         vec2 sp = blockPos + vec2(uTime * 0.85, 0.0) + vec2(-0.08, -0.06) * dh;
-        float cShadow = smoothstep(0.79, 0.87, cloudField(sp));
+        float cd = texture(uCloudTex, sp * (1.0 / 128.0)).r;
+        float cShadow = smoothstep(0.755, 0.845, cd);
         skyCol *= mix(vec3(1.0), vec3(0.42, 0.50, 0.66), cShadow);
       }
 
-      // 夜・深洞窟はほぼ真っ暗（わずかな月明かりベース 0.014 のみ）
       vec3 baseDark = vec3(0.012, 0.016, 0.026);
       return min(vec3(1.22), baseDark + skyCol + blockCol * (1.0 - sL * 0.42));
     }
@@ -291,12 +254,17 @@
       int bz = vSliceZ / 8;
       int lz = vSliceZ - bz * 8;
       ivec2 bxy = ivec2(floor(vBlockPos));
+      bool isBlockPlane = (lz == 0);
 
-      // 1. 固体地形スライス評価（各木ブロックが形を崩さず剛体として独立に揺れる 2x2 探索）
+      // uWaterTex を1回だけフェッチして固体・水・松明・煙・草花すべての早期スキップに使う！
+      ivec2 curW = sampleWaterCell(bxy, bz);
+      int visLevel = curW.x & 15;
+      bool nearTorchSmoke = (curW.x & 128) != 0;
+      int curFlags = curW.y;
+      bool curSolid = (curFlags & 2) != 0;
+
+      // 1. 固体地形スライス評価（空中の無駄な 768x768 テクスチャフェッチを完全回避！）
       if (uMode != 2 && vSliceZ < uTerrainLayers) {
-        bool isBlockPlane = (lz == 0);
-        int curFlags = sampleWaterCell(bxy, bz).y;
-
         vec4 tCol = vec4(0.0);
         bool drewTree = false;
         ivec2 effBxy = bxy;
@@ -361,13 +329,16 @@
           }
         }
 
-        // 木以外の通常地形（元の位置に残る木のゴーストは描かない）
-        if (!drewTree) {
+        // 木以外の通常地形（固体ブロックまたは境界天面があるときだけ uTerrainTex を読む！）
+        if (!drewTree && (curSolid || (isBlockPlane && bz > 0))) {
           bool curIsTree = (curFlags & 16) != 0;
-          if (!curIsTree && isBlockPlane && bz > 0 && (curFlags & 2) == 0) {
-            curIsTree = (sampleWaterCell(bxy, bz - 1).y & 16) != 0;
+          bool hasBelowSolid = false;
+          if (!curSolid && isBlockPlane && bz > 0) {
+            int belowF = sampleWaterCell(bxy, bz - 1).y;
+            hasBelowSolid = (belowF & 2) != 0;
+            if ((belowF & 16) != 0) curIsTree = true;
           }
-          if (!curIsTree) {
+          if (!curIsTree && (curSolid || hasBelowSolid)) {
             tCol = texture(uTerrainTex, vec3(uv, float(vSliceZ)));
           }
         }
@@ -455,12 +426,15 @@
 
       if (uMode == 1) discard;
 
-      ivec2 curW = sampleWaterCell(bxy, bz);
-      int visLevel = curW.x;
-      int flags = curW.y;
-      bool curSolid = (flags & 2) != 0;
+      int flags = curFlags;
       bool isFalling = (flags & 1) != 0;
       bool isTorch = (flags & 8) != 0;
+      int foliageType = (flags >> 6) & 3;
+
+      // 空の空中フラグメントを即座に破棄（水・松明・煙・草花のいずれも無いマスをゼロコストでスキップ！）
+      if (visLevel == 0 && !isTorch && !nearTorchSmoke && foliageType == 0 && !(isBlockPlane && bz > 0 && !curSolid)) {
+        discard;
+      }
 
       // 2. 設置された松明の 3D 描画（木の柄＋ゆらめく自己発光の炎！）
       if (isTorch && bz < uWorldZ) {
@@ -485,8 +459,8 @@
         }
       }
 
-      // 2.2 松明から立ち上り、風（東→西）に長くたなびいて流れていく煙
-      if (!curSolid && visLevel == 0 && bz >= 1 && bz < uWorldZ) {
+      // 2.2 松明から立ち上り、風（東→西）に長くたなびいて流れていく煙（nearTorchSmoke マスのみ実行！）
+      if (nearTorchSmoke && !curSolid && visLevel == 0 && bz >= 1 && bz < uWorldZ) {
         ivec3 srcTorch = ivec3(-1);
         for (int dz = 1; dz <= 3; dz++) {
           int tz = bz - dz;
@@ -540,7 +514,6 @@
       }
 
       // 2.5 草ブロック上の揺れる雑草・野花の 3D スプライトスタッキング描画
-      int foliageType = (flags >> 6) & 3;
       if (foliageType > 0 && !isTorch && visLevel == 0 && bz < uWorldZ && lz <= 6) {
         // 透視モードで丘を切り抜いている範囲の草花は宙に浮かないよう非表示にする
         bool culledByXray = false;
@@ -678,7 +651,7 @@
         isSurface = true;
       } else if (lz == 0 && bz > 0 && visLevel == 0 && !curSolid) {
         ivec2 belowW = sampleWaterCell(bxy, bz - 1);
-        if (belowW.x == 8) {
+        if ((belowW.x & 15) == 8) {
           isSurface = true;
           surfBz = bz - 1;
         }
@@ -910,6 +883,7 @@
   const CLOUD_FS = `#version 300 es
     precision highp float;
 
+    uniform sampler2D uCloudTex;
     uniform vec2 uViewport;
     uniform float uTime;
     uniform float uSunBrightness;
@@ -928,62 +902,24 @@
       return fract(p.x * p.y);
     }
 
-    vec2 cloudHash2(vec2 p) {
-      vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
-      p3 += dot(p3, p3.yzx + 33.33);
-      return fract((p3.xx + p3.yz) * p3.zy);
-    }
-
-    float cloudNoise(vec2 p) {
-      vec2 i = floor(p);
-      vec2 f = fract(p);
-      vec2 u = f * f * (3.0 - 2.0 * f);
-      return mix(
-        mix(cloudHash(i), cloudHash(i + vec2(1.0, 0.0)), u.x),
-        mix(cloudHash(i + vec2(0.0, 1.0)), cloudHash(i + vec2(1.0, 1.0)), u.x),
-        u.y
-      );
-    }
-
-    float cloudPuffDomes(vec2 p) {
-      vec2 gp = p * 0.135;
-      vec2 ip = floor(gp);
-      vec2 fp = fract(gp);
-      float best = 0.0;
-      for (int j = -1; j <= 1; j++) {
-        for (int i = -1; i <= 1; i++) {
-          vec2 cell = ip + vec2(float(i), float(j));
-          vec2 h = cloudHash2(cell + vec2(4.7, 9.1));
-          vec2 center = vec2(float(i), float(j)) + 0.18 + h * 0.64;
-          float r = 0.62 + h.x * 0.36;
-          float d = length(fp - center) / r;
-          float dome = clamp(1.0 - d * d, 0.0, 1.0);
-          best = max(best, dome);
-        }
-      }
-      return sqrt(best);
-    }
-
-    float cloudField(vec2 p) {
-      float base =
-        cloudNoise(p * vec2(0.038, 0.050) + vec2(3.1, 7.4)) * 0.72 +
-        cloudNoise(p * vec2(0.082, 0.096) + vec2(11.7, 2.9)) * 0.28;
-      if (base < 0.36) return 0.0;
-      float puffs = cloudPuffDomes(p);
-      return base * 0.68 + puffs * 0.42;
-    }
-
-    // 1×1×1 雲ブロックの積み上げ段数 (0=空 ~80%, 1=縁 ~10%, 2=雲本体 ~6%, 3=もこもこ頂上 ~4%)
+    // 事前ベイク済み 128x128 周期テクスチャを1回フェッチするだけの超高速雲高さ判定！
     int cloudHeightBlocks(vec2 q) {
-      float d = cloudField(q + 0.5);
-      if (d < 0.810) return 0;
-      if (d < 0.865) return 1;
-      if (d < 0.915) return 2;
+      ivec2 cq = ivec2(mod(q, 128.0));
+      float d = texelFetch(uCloudTex, cq, 0).r;
+      if (d < 0.775) return 0;
+      if (d < 0.835) return 1;
+      if (d < 0.885) return 2;
       return 3;
     }
 
     void main() {
-      // 東(+X)から西(-X)へゆっくり流れる、大きさ 1×1×1 の「雲ブロック」が集まった立体雲！
+      // まずプレイヤー周辺のクリア範囲を最速で破棄（不要なテクスチャフェッチをゼロに！）
+      float minView = min(uViewport.x, uViewport.y);
+      float rInner = min(uBlockPx * 5.5, minView * 0.29);
+      float pDist = length(gl_FragCoord.xy - uPlayerScreenPos);
+      if (pDist < rInner) discard;
+
+      // 東(+X)から西(-X)へゆっくり流れる、大きさ 1×1×1 の「雲ブロック」集合体
       vec2 p = vWorldXY + vec2(uTime * 0.85, 0.0);
       vec2 q = floor(p);
       int h = cloudHeightBlocks(q);
@@ -1000,7 +936,6 @@
       if (cz < h) {
         drawCz = cz;
       } else if (isBlockPlane && cz > 0 && cz == h) {
-        // 地形と同じ共有境界スライス方式の露出天面キャップ（隙間ゼロの完全1×1×1立方体！）
         drawCz = cz - 1;
         drawLz = 7;
         isTopCap = true;
@@ -1008,32 +943,32 @@
         discard;
       }
 
-      // 地形ブロックと同じ 6×6 ピクセル解像度のボクセル質感
+      float rOuter = min(uBlockPx * 9.5, minView * 0.46);
+      if (pDist < rOuter && !isTopCap) discard;
+
       vec2 cellUv = fract(p);
       vec2 pix = floor(cellUv * 6.0);
       float pixNoise = cloudHash(q * 7.0 + pix + vec2(float(drawCz) * 13.0, float(drawLz) * 5.0));
 
-      int hW = cloudHeightBlocks(q + vec2(-1.0, 0.0));
-      int hE = cloudHeightBlocks(q + vec2( 1.0, 0.0));
-      int hN = cloudHeightBlocks(q + vec2( 0.0,-1.0));
-      int hS = cloudHeightBlocks(q + vec2( 0.0, 1.0));
-
       float shade = 1.0;
 
       if (isTopCap) {
-        // 雲ブロックの上面：明るく真っ白＋段差の縁にベベル＋上に重なる雲ブロックの根元に3D AO影！
+        int hW = cloudHeightBlocks(q + vec2(-1.0, 0.0));
+        int hE = cloudHeightBlocks(q + vec2( 1.0, 0.0));
+        int hN = cloudHeightBlocks(q + vec2( 0.0,-1.0));
+        int hS = cloudHeightBlocks(q + vec2( 0.0, 1.0));
+
         shade = 1.03 + float(drawCz) * 0.035;
         bool stepW = hW > drawCz + 1;
         bool stepE = hE > drawCz + 1;
         bool stepN = hN > drawCz + 1;
         bool stepS = hS > drawCz + 1;
         if ((stepW && pix.x <= 0.5) || (stepE && pix.x >= 4.5) || (stepN && pix.y <= 0.5) || (stepS && pix.y >= 4.5)) {
-          shade *= 0.80; // 1段高い雲ブロックとの境目に立体的なAO影
+          shade *= 0.80;
         } else if ((stepW && pix.x <= 1.5) || (stepE && pix.x >= 3.5) || (stepN && pix.y <= 1.5) || (stepS && pix.y >= 3.5)) {
           shade *= 0.91;
         }
 
-        // 外周ドロップ縁の輪郭エッジ（1ブロックごとの角がクッキリ分かる！）
         bool dropW = hW <= drawCz;
         bool dropE = hE <= drawCz;
         bool dropN = hN <= drawCz;
@@ -1044,7 +979,6 @@
           shade *= 1.05;
         }
       } else {
-        // 雲ブロックの側面（blocks.js の地形ブロックと同じ方向別ライティング＋段差陰影）
         float sideLight = 0.78;
         float dW = pix.x;
         float dE = 5.0 - pix.x;
@@ -1059,39 +993,26 @@
           if (dE == minD) sideLight = min(sideLight, 0.94);
         }
         float vGrad = 0.84 + (float(drawLz) / 7.0) * 0.16;
-        // 最下段の雲底をわずかにクールに締める
         float baseAO = (drawCz == 0 && drawLz <= 1) ? 0.90 : 1.0;
         shade = sideLight * vGrad * baseAO * (0.94 + float(drawCz) * 0.04);
       }
 
-      // 6×6 ドットごとのわずかな雲テクスチャムラ（のっぺりさせずボクセル感を強調）
       shade *= (0.965 + pixNoise * 0.065);
 
-      // 昼(真っ白＋涼やかな青灰側面) / 夕方(茜・黄金) / 夜(月明かりの濃い紺)
       float dayAmt = clamp(uSunBrightness * 1.15, 0.0, 1.0);
       vec3 litCol = mix(vec3(0.11, 0.15, 0.25), min(vec3(1.06), uSkyLightColor * vec3(1.02, 1.02, 1.04)), dayAmt);
       vec3 shadowCol = mix(vec3(0.04, 0.06, 0.12), uSkyLightColor * vec3(0.56, 0.68, 0.86), dayAmt);
       vec3 col = mix(shadowCol, litCol, clamp((shade - 0.56) / 0.52, 0.0, 1.0));
 
-      // プレイヤー周辺の広い範囲を完全に透かして視界を確保（25枚重なっても白く潰れないよう単層フェード）
-      float minView = min(uViewport.x, uViewport.y);
-      float rInner = min(uBlockPx * 5.5, minView * 0.29);
-      float rOuter = min(uBlockPx * 9.5, minView * 0.46);
-      float pDist = length(gl_FragCoord.xy - uPlayerScreenPos);
-      if (pDist < rInner) discard;
-
       float alpha = 0.92;
       if (pDist < rOuter) {
-        // 遷移ゾーンでは上面キャップ(1層)だけを滑らかにフェードし、多重スライスによる不透明化を防ぐ
-        if (!isTopCap) discard;
-        float t = smoothstep(rInner, rOuter, pDist);
-        alpha = t * 0.65;
+        alpha = smoothstep(rInner, rOuter, pDist) * 0.65;
       }
       outColor = vec4(col, alpha);
     }
   `;
 
-  // JS 側でもプレイヤーの受光色へ同じもこもこ雲の影を同期させる軽量ヘルパー
+  // 起動時に1回だけシームレス 128x128 周期積雲マップを事前ベイク（GPU＆CPU両方で共有し Voronoi 計算を毎フレーム0に！）
   function fractJS(x) {
     return x - Math.floor(x);
   }
@@ -1113,48 +1034,72 @@
     z += dot;
     return [fractJS((x + y) * z), fractJS((x + z) * y)];
   }
-  function cloudNoiseJS(px, py) {
-    const ix = Math.floor(px);
-    const iy = Math.floor(py);
-    const fx = px - ix;
-    const fy = py - iy;
+  function periodicNoiseJS(px, py, perX, perY, offX, offY) {
+    const gx = (px / 128) * perX;
+    const gy = (py / 128) * perY;
+    const ix0 = ((Math.floor(gx) % perX) + perX) % perX;
+    const iy0 = ((Math.floor(gy) % perY) + perY) % perY;
+    const ix1 = (ix0 + 1) % perX;
+    const iy1 = (iy0 + 1) % perY;
+    const fx = gx - Math.floor(gx);
+    const fy = gy - Math.floor(gy);
     const ux = fx * fx * (3 - 2 * fx);
     const uy = fy * fy * (3 - 2 * fy);
-    const a = cloudHashJS(ix, iy);
-    const b = cloudHashJS(ix + 1, iy);
-    const c = cloudHashJS(ix, iy + 1);
-    const d = cloudHashJS(ix + 1, iy + 1);
+    const a = cloudHashJS(ix0 + offX, iy0 + offY);
+    const b = cloudHashJS(ix1 + offX, iy0 + offY);
+    const c = cloudHashJS(ix0 + offX, iy1 + offY);
+    const d = cloudHashJS(ix1 + offX, iy1 + offY);
     return a + (b - a) * ux + (c + (d - c) * ux - (a + (b - a) * ux)) * uy;
   }
+  const CLOUD_MAP_SIZE = 128;
+  const CLOUD_MAP_BYTES = new Uint8Array(CLOUD_MAP_SIZE * CLOUD_MAP_SIZE);
+  (function bakePeriodicCloudMap() {
+    const puffPer = 16;
+    for (let y = 0; y < CLOUD_MAP_SIZE; y++) {
+      for (let x = 0; x < CLOUD_MAP_SIZE; x++) {
+        const px = x + 0.5;
+        const py = y + 0.5;
+        const base =
+          periodicNoiseJS(px, py, 5, 6, 3.1, 7.4) * 0.72 +
+          periodicNoiseJS(px, py, 11, 12, 11.7, 2.9) * 0.28;
+        let val = 0;
+        if (base >= 0.36) {
+          const gx = (px / 128) * puffPer;
+          const gy = (py / 128) * puffPer;
+          const ipx = Math.floor(gx);
+          const ipy = Math.floor(gy);
+          const fpx = gx - ipx;
+          const fpy = gy - ipy;
+          let best = 0;
+          for (let j = -1; j <= 1; j++) {
+            for (let i = -1; i <= 1; i++) {
+              const cxCell = ((ipx + i) % puffPer + puffPer) % puffPer;
+              const cyCell = ((ipy + j) % puffPer + puffPer) % puffPer;
+              const h = cloudHash2JS(cxCell + 4.7, cyCell + 9.1);
+              const cx = i + 0.18 + h[0] * 0.64;
+              const cy = j + 0.18 + h[1] * 0.64;
+              const r = 0.62 + h[0] * 0.36;
+              const dx = (fpx - cx) / r;
+              const dy = (fpy - cy) / r;
+              const dome = Math.max(0, 1 - (dx * dx + dy * dy));
+              if (dome > best) best = dome;
+            }
+          }
+          val = Math.min(1, base * 0.68 + Math.sqrt(best) * 0.42);
+        }
+        CLOUD_MAP_BYTES[y * CLOUD_MAP_SIZE + x] = Math.round(val * 255);
+      }
+    }
+  })();
+
   function evalCloudShadowJS(wx, wy, wz, timeSec) {
     const dh = Math.max(0, 20.0 - wz);
     const px = wx + timeSec * 0.85 - 0.08 * dh;
     const py = wy - 0.06 * dh;
-    const base =
-      cloudNoiseJS(px * 0.038 + 3.1, py * 0.050 + 7.4) * 0.72 +
-      cloudNoiseJS(px * 0.082 + 11.7, py * 0.096 + 2.9) * 0.28;
-    if (base < 0.36) return 0;
-    const gpx = px * 0.135;
-    const gpy = py * 0.135;
-    const ipx = Math.floor(gpx);
-    const ipy = Math.floor(gpy);
-    const fpx = gpx - ipx;
-    const fpy = gpy - ipy;
-    let best = 0;
-    for (let j = -1; j <= 1; j++) {
-      for (let i = -1; i <= 1; i++) {
-        const h = cloudHash2JS(ipx + i + 4.7, ipy + j + 9.1);
-        const cx = i + 0.18 + h[0] * 0.64;
-        const cy = j + 0.18 + h[1] * 0.64;
-        const r = 0.62 + h[0] * 0.36;
-        const dx = (fpx - cx) / r;
-        const dy = (fpy - cy) / r;
-        const dome = Math.max(0, 1 - (dx * dx + dy * dy));
-        if (dome > best) best = dome;
-      }
-    }
-    const cd = base * 0.68 + Math.sqrt(best) * 0.42;
-    const t = Math.max(0, Math.min(1, (cd - 0.79) / (0.87 - 0.79)));
+    const ix = ((Math.floor(px) % 128) + 128) % 128;
+    const iy = ((Math.floor(py) % 128) + 128) % 128;
+    const cd = CLOUD_MAP_BYTES[iy * 128 + ix] / 255;
+    const t = Math.max(0, Math.min(1, (cd - 0.755) / (0.845 - 0.755)));
     return t * t * (3 - 2 * t);
   }
 
@@ -1230,6 +1175,7 @@
       uWaterTex: gl.getUniformLocation(worldProg, "uWaterTex"),
       uLightTex: gl.getUniformLocation(worldProg, "uLightTex"),
       uTreeSwayTex: gl.getUniformLocation(worldProg, "uTreeSwayTex"),
+      uCloudTex: gl.getUniformLocation(worldProg, "uCloudTex"),
       uWorldZ: gl.getUniformLocation(worldProg, "uWorldZ"),
       uTerrainLayers: gl.getUniformLocation(worldProg, "uTerrainLayers"),
       uTime: gl.getUniformLocation(worldProg, "uTime"),
@@ -1268,6 +1214,7 @@
     };
 
     const cLoc = {
+      uCloudTex: gl.getUniformLocation(cloudProg, "uCloudTex"),
       uViewport: gl.getUniformLocation(cloudProg, "uViewport"),
       uCenter: gl.getUniformLocation(cloudProg, "uCenter"),
       uCamXY: gl.getUniformLocation(cloudProg, "uCamXY"),
@@ -1341,6 +1288,17 @@
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    // 事前ベイク済み 128x128 周期積雲テクスチャ (R8, LINEAR, REPEAT — 16KB)
+    const cloudTex = gl.createTexture();
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.bindTexture(gl.TEXTURE_2D, cloudTex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, CLOUD_MAP_SIZE, CLOUD_MAP_SIZE);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, CLOUD_MAP_SIZE, CLOUD_MAP_SIZE, gl.RED, gl.UNSIGNED_BYTE, CLOUD_MAP_BYTES);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
 
     let boundWorld = null;
     let boundTerrainKey = "";
@@ -1678,6 +1636,9 @@
         gl.activeTexture(gl.TEXTURE4);
         gl.bindTexture(gl.TEXTURE_2D, treeSwayTex);
         gl.uniform1i(wLoc.uTreeSwayTex, 4);
+        gl.activeTexture(gl.TEXTURE5);
+        gl.bindTexture(gl.TEXTURE_2D, cloudTex);
+        gl.uniform1i(wLoc.uCloudTex, 5);
 
         gl.uniform2f(wLoc.uViewport, viewW, viewH);
         gl.uniform2f(wLoc.uCenter, centerX, centerY);
@@ -1885,6 +1846,9 @@
       if (cloudsEnabled && settings.maxVisibleSlice >= world.maxUsedSlice) {
         currentProg = cloudProg;
         gl.useProgram(cloudProg);
+        gl.activeTexture(gl.TEXTURE5);
+        gl.bindTexture(gl.TEXTURE_2D, cloudTex);
+        gl.uniform1i(cLoc.uCloudTex, 5);
         gl.uniform2f(cLoc.uViewport, viewW, viewH);
         gl.uniform2f(cLoc.uCenter, centerX, centerY);
         gl.uniform2f(cLoc.uCamXY, cam.x, cam.y);
