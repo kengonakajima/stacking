@@ -14,7 +14,7 @@
 (function (global) {
   "use strict";
 
-  const { BLOCK_SIZE, BLOCK_SLICES, PLAYER_POSES } = global.VoxelWalk;
+  const { BLOCK_SIZE, BLOCK_SLICES, PLAYER_POSES, SHEEP_POSES } = global.VoxelWalk;
 
   const WORLD_VS = `#version 300 es
     precision highp float;
@@ -481,6 +481,60 @@
             vec3 flameCol = dFlame < rMax * 0.55 ? vec3(1.0, 0.96, 0.65) : vec3(1.0, 0.56, 0.12);
             outColor = vec4(flameCol, 1.0);
             return;
+          }
+        }
+      }
+
+      // 2.2 松明から立ち上り、風（東→西）に長くたなびいて流れていく煙
+      if (!curSolid && visLevel == 0 && bz >= 1 && bz < uWorldZ) {
+        ivec3 srcTorch = ivec3(-1);
+        for (int dz = 1; dz <= 3; dz++) {
+          int tz = bz - dz;
+          if (tz < 0) continue;
+          for (int dx = 0; dx <= 3; dx++) {
+            ivec2 txy = bxy + ivec2(dx, 0);
+            if ((sampleWaterCell(txy, tz).y & 8) != 0) {
+              // 松明のすぐ上に天井ブロックがある場合は煙が貫通しないようにする
+              if (dz >= 2 && (sampleWaterCell(txy, tz + 1).y & 2) != 0) continue;
+              srcTorch = ivec3(txy, tz);
+              break;
+            }
+          }
+          if (srcTorch.x >= 0) break;
+        }
+
+        if (srcTorch.x >= 0) {
+          float curZ = float(vSliceZ) * 0.125;
+          vec2 tSeed = hash22(vec2(srcTorch.xy) + vec2(float(srcTorch.z) * 7.3, 19.1));
+          // 東→西(-X)への風とわずかな強弱
+          float gust = 0.85 + 0.25 * sin(uTime * 0.75 + float(srcTorch.x) * 0.12);
+
+          // 7粒の煙が約6.2秒かけてゆっくり上昇しつつ西へ長くたなびく
+          for (int p = 0; p < 7; p++) {
+            float fp = float(p);
+            float age = fract(uTime * 0.16 + fp * (1.0 / 7.0) + tSeed.x);
+            float puffZ = float(srcTorch.z) + 0.92 + pow(age, 0.85) * 2.65;
+            float r = mix(0.072, 0.165, age);
+            float dzPuff = abs(curZ - puffZ);
+            if (dzPuff > r * 1.2) continue;
+
+            // 風で西(-X)へ最大約3ブロック先まで長く流れていく
+            float driftX = -pow(age, 1.32) * 2.95 * gust + sin(age * 6.0 + fp * 1.7 + tSeed.y * 6.28) * 0.08 * age;
+            float driftY = age * 0.18 + cos(age * 5.2 + fp * 2.3 + uTime * 1.1) * 0.13 * age;
+            vec2 puffXY = vec2(srcTorch.xy) + vec2(0.5 + driftX, 0.5 + driftY);
+
+            vec2 dxy = abs(vBlockPos - puffXY);
+            if (max(dxy.x, dxy.y) < r) {
+              float fade = smoothstep(0.0, 0.09, age) * (1.0 - smoothstep(0.55, 1.0, age));
+              float softCore = 1.0 - max(max(dxy.x, dxy.y) / r, dzPuff / (r * 1.2)) * 0.42;
+              vec3 smokeTint = mix(vec3(0.58, 0.50, 0.42), vec3(0.76, 0.80, 0.85), smoothstep(0.0, 0.55, age));
+              vec3 lightCol = max(vec3(0.28, 0.25, 0.24), evalWorldLight(vBlockPos, vSliceZ));
+              float smokeAlpha = 0.34 * fade * softCore;
+              if (smokeAlpha > 0.015) {
+                outColor = vec4(smokeTint * lightCol, smokeAlpha);
+                return;
+              }
+            }
           }
         }
       }
@@ -1258,10 +1312,41 @@
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
+    // 白い羊モブ用 3D スプライト配列テクスチャ (10x10 x 9スライス x 3ポーズ)
+    const sSliceCount = SHEEP_POSES.sliceCount;
+    const sTexSize = SHEEP_POSES.size;
+    const sheepTex = gl.createTexture();
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, sheepTex);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, sTexSize, sTexSize, sSliceCount * 3);
+    const allSheepPoses = [SHEEP_POSES.rawIdle, SHEEP_POSES.rawStepA, SHEEP_POSES.rawStepB];
+    for (let p = 0; p < 3; p++) {
+      for (let z = 0; z < sSliceCount; z++) {
+        gl.texSubImage3D(
+          gl.TEXTURE_2D_ARRAY,
+          0,
+          0,
+          0,
+          p * sSliceCount + z,
+          sTexSize,
+          sTexSize,
+          1,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          allSheepPoses[p][z]
+        );
+      }
+    }
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
     let boundWorld = null;
     let boundTerrainKey = "";
     let terrainTex = null;
     let terrainLayers = 0;
+    let uploadedTerrainVer = -1;
     let waterTex = null;
     let uploadedWaterVer = -1;
     let lightTex = null;
@@ -1272,12 +1357,27 @@
 
     function syncTerrainTexture(world, useAO, useEdge) {
       const key = `${useAO ? 1 : 0}_${useEdge ? 1 : 0}`;
-      if (boundWorld === world && boundTerrainKey === key && terrainTex) return;
-
       const pack = world.getSlicePack(useAO, useEdge);
       const layers = world.maxUsedSlice;
       const w = world.canvasW;
       const h = world.canvasH;
+      const curVer = world.getTerrainTexVersion ? world.getTerrainTexVersion() : 0;
+
+      if (boundWorld === world && boundTerrainKey === key && terrainTex) {
+        if (curVer !== uploadedTerrainVer && world.dirtyTerrainSlices) {
+          gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+          gl.bindTexture(gl.TEXTURE_2D_ARRAY, terrainTex);
+          for (let z = 0; z < layers; z++) {
+            if (!world.dirtyTerrainSlices[z]) continue;
+            world.dirtyTerrainSlices[z] = 0;
+            const bytes = pack.slices[z];
+            if (!bytes) continue;
+            gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, z, w, h, 1, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
+          }
+          uploadedTerrainVer = curVer;
+        }
+        return;
+      }
 
       if (terrainTex) gl.deleteTexture(terrainTex);
       terrainTex = gl.createTexture();
@@ -1299,6 +1399,8 @@
 
       terrainLayers = layers;
       boundTerrainKey = key;
+      uploadedTerrainVer = curVer;
+      if (world.dirtyTerrainSlices) world.dirtyTerrainSlices.fill(0);
     }
 
     function syncWaterTexture(world) {
@@ -1424,6 +1526,9 @@
         gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, filt);
       }
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, playerTex);
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, filt);
+      gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, filt);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, sheepTex);
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, filt);
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, filt);
     }
@@ -1599,25 +1704,44 @@
         gl.uniform1i(wLoc.uXrayMode, xrayMode);
       }
 
-      function useSpriteProgram() {
-        if (currentProg === spriteProg) return;
-        currentProg = spriteProg;
-        gl.useProgram(spriteProg);
-        gl.activeTexture(gl.TEXTURE2);
-        gl.bindTexture(gl.TEXTURE_2D_ARRAY, playerTex);
-        gl.uniform1i(sLoc.uPlayerTex, 2);
+      let boundSpriteTex = null;
 
-        gl.uniform2f(sLoc.uViewport, viewW, viewH);
-        gl.uniform2f(sLoc.uCenter, centerX, centerY);
-        gl.uniform2f(sLoc.uCamXY, cam.x, cam.y);
-        gl.uniform1f(sLoc.uCamBaseSlice, camBaseSlice);
-        gl.uniform2f(sLoc.uYawCS, cosYaw, sinYaw);
-        gl.uniform1f(sLoc.uSquashY, squashY);
-        gl.uniform1f(sLoc.uLiftPerSlice, liftPerSlice);
-        gl.uniform1f(sLoc.uBlockPx, blockScreenPx);
-        gl.uniform2f(sLoc.uSpriteBlockXY, player.x, player.y);
-        gl.uniform2f(sLoc.uFacingCS, Math.cos(player.facing), Math.sin(player.facing));
-        gl.uniform3f(sLoc.uPlayerTint, pTintR, pTintG, pTintB);
+      function useSpriteProgram(texToBind) {
+        const targetTex = texToBind || playerTex;
+        if (currentProg !== spriteProg) {
+          currentProg = spriteProg;
+          gl.useProgram(spriteProg);
+          gl.uniform2f(sLoc.uViewport, viewW, viewH);
+          gl.uniform2f(sLoc.uCenter, centerX, centerY);
+          gl.uniform2f(sLoc.uCamXY, cam.x, cam.y);
+          gl.uniform1f(sLoc.uCamBaseSlice, camBaseSlice);
+          gl.uniform2f(sLoc.uYawCS, cosYaw, sinYaw);
+          gl.uniform1f(sLoc.uSquashY, squashY);
+          gl.uniform1f(sLoc.uLiftPerSlice, liftPerSlice);
+          gl.uniform1f(sLoc.uBlockPx, blockScreenPx);
+          boundSpriteTex = null;
+        }
+        if (boundSpriteTex !== targetTex) {
+          boundSpriteTex = targetTex;
+          gl.activeTexture(gl.TEXTURE2);
+          gl.bindTexture(gl.TEXTURE_2D_ARRAY, targetTex);
+          gl.uniform1i(sLoc.uPlayerTex, 2);
+        }
+      }
+
+      function computeEntityTint(ex, ey, ez, minFloor) {
+        const l = world.getLightAt(ex, ey, ez);
+        const bL = Math.pow(l.block / 15, 1.55);
+        const sL = Math.pow(l.sky / 15, 1.35) * sunBrightness;
+        const cSh = cloudsEnabled && sL > 0.01 ? evalCloudShadowJS(ex, ey, ez, timeSec) : 0;
+        const skyR = skyLightColor[0] * sL * (1 - cSh * 0.58);
+        const skyG = skyLightColor[1] * sL * (1 - cSh * 0.50);
+        const skyB = skyLightColor[2] * sL * (1 - cSh * 0.34);
+        return [
+          Math.min(1.2, Math.max(minFloor, skyR + 1.12 * bL * (1 - sL * 0.4))),
+          Math.min(1.2, Math.max(minFloor + 0.01, skyG + 0.78 * bL * (1 - sL * 0.4))),
+          Math.min(1.2, Math.max(minFloor + 0.05, skyB + 0.44 * bL * (1 - sL * 0.4))),
+        ];
       }
 
       function drawWorldBatch(startZ, count, mode) {
@@ -1630,54 +1754,131 @@
         else worldDrawCalls++;
       }
 
-      function drawShadowQuad() {
-        if (floorInfo.floorZ <= 0 || shadowSliceZ >= limitZ) return;
-        const heightAboveFloor = Math.max(0, player.z - floorInfo.floorZ);
-        const shadowScale = Math.max(0.45, 1 - heightAboveFloor * 0.22);
-        useSpriteProgram();
-        gl.uniform1i(sLoc.uIsShadow, 1);
-        gl.uniform1f(sLoc.uShadowAlpha, 0.34 * shadowScale * Math.max(0.25, sunBrightness));
-        gl.uniform1f(sLoc.uSpriteSizeBlocks, 0.72 * shadowScale);
-        gl.uniform1i(sLoc.uSliceZ, shadowSliceZ);
-        gl.uniform1i(sLoc.uShowBox, 0);
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
-        miscDrawCalls++;
+      // プレイヤー＋画面内の白い羊モブをすべて同じスライス・インターリーブ描画リストへ収集
+      const entities = [
+        {
+          tex: playerTex,
+          x: player.x,
+          y: player.y,
+          z: player.z,
+          facing: player.facing,
+          baseSlice: playerBaseSlice,
+          sliceCount: pSliceCount,
+          poseIdx,
+          sizeBlocks: 0.96,
+          shadowSize: 0.72,
+          floorZ: floorInfo.floorZ,
+          shadowSliceZ,
+          tint: [pTintR, pTintG, pTintB],
+          isPlayer: true,
+        },
+      ];
+
+      if (world.sheep && world.sheep.length > 0) {
+        for (let i = 0; i < world.sheep.length; i++) {
+          const sh = world.sheep[i];
+          if (sh.x < minBx - 2 || sh.x > maxBx + 2 || sh.y < minBy - 2 || sh.y > maxBy + 2) continue;
+          let shPose = 0;
+          if (sh.isMoving && sh.onGround) {
+            const cy = Math.floor(sh.walkCycle * 6) % 4;
+            if (cy === 1) shPose = 1;
+            else if (cy === 3) shPose = 2;
+          } else if (!sh.onGround) {
+            shPose = 1;
+          }
+          const shBase = Math.round(sh.z * BLOCK_SLICES);
+          const shFloor = world.findFloorBelow(sh.x, sh.y, sh.z + 0.05);
+          entities.push({
+            tex: sheepTex,
+            x: sh.x,
+            y: sh.y,
+            z: sh.z,
+            facing: sh.facing,
+            baseSlice: shBase,
+            sliceCount: sSliceCount,
+            poseIdx: shPose,
+            sizeBlocks: 1.12,
+            shadowSize: 0.88,
+            floorZ: shFloor.floorZ,
+            shadowSliceZ: Math.round(shFloor.floorZ * BLOCK_SLICES),
+            tint: computeEntityTint(sh.x, sh.y, sh.z + 0.6, 0.06),
+            isPlayer: false,
+          });
+        }
       }
 
-      const pStart = Math.max(0, Math.min(limitZ, playerBaseSlice));
-      const pEnd = Math.max(pStart, Math.min(limitZ, playerMaxSlice + 1));
+      // 画面手前奥ソート（同一スライス上で羊同士・プレイヤー同士が重なっても前後関係が正確）
+      entities.sort((a, b) => (a.x * sinYaw + a.y * cosYaw) - (b.x * sinYaw + b.y * cosYaw));
 
-      if (floorInfo.floorZ > 0 && shadowSliceZ < pStart) {
-        drawWorldBatch(0, shadowSliceZ, 0);
-        drawWorldBatch(shadowSliceZ, 1, 1);
-        drawShadowQuad();
-        drawWorldBatch(shadowSliceZ, 1, 2);
-        drawWorldBatch(shadowSliceZ + 1, pStart - (shadowSliceZ + 1), 0);
-      } else {
-        drawWorldBatch(0, pStart, 0);
+      // エンティティまたは影が存在するスライスだけ個別分割し、それ以外はまとめてインスタンシング一括描画！
+      const sliceHasEntity = new Uint8Array(limitZ);
+      for (let i = 0; i < entities.length; i++) {
+        const e = entities[i];
+        if (e.floorZ > 0 && e.shadowSliceZ >= 0 && e.shadowSliceZ < limitZ) {
+          sliceHasEntity[e.shadowSliceZ] = 1;
+        }
+        const z0 = Math.max(0, e.baseSlice);
+        const z1 = Math.min(limitZ - 1, e.baseSlice + e.sliceCount - 1);
+        for (let z = z0; z <= z1; z++) {
+          sliceHasEntity[z] = 1;
+        }
       }
 
-      for (let z = pStart; z < pEnd; z++) {
-        drawWorldBatch(z, 1, 1);
-
-        if (z === shadowSliceZ && floorInfo.floorZ > 0) {
-          drawShadowQuad();
+      let runStart = 0;
+      for (let z = 0; z < limitZ; z++) {
+        if (!sliceHasEntity[z]) continue;
+        if (z > runStart) {
+          drawWorldBatch(runStart, z - runStart, 0);
         }
 
-        useSpriteProgram();
-        gl.uniform1i(sLoc.uIsShadow, 0);
-        gl.uniform1i(sLoc.uPlayerLayer, poseIdx * pSliceCount + (z - playerBaseSlice));
-        gl.uniform1f(sLoc.uSpriteSizeBlocks, 0.96);
-        gl.uniform1i(sLoc.uSliceZ, z);
-        gl.uniform1i(sLoc.uShowBox, settings.showWireframe && (z - playerBaseSlice) % 3 === 0 ? 1 : 0);
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
-        miscDrawCalls++;
+        // 1. このスライスの固体地形
+        drawWorldBatch(z, 1, 1);
 
+        // 2. このスライスに落ちる全エンティティの接地影
+        for (let i = 0; i < entities.length; i++) {
+          const e = entities[i];
+          if (e.floorZ > 0 && e.shadowSliceZ === z) {
+            const hAbove = Math.max(0, e.z - e.floorZ);
+            const shScale = Math.max(0.45, 1 - hAbove * 0.22);
+            useSpriteProgram(e.tex);
+            gl.uniform2f(sLoc.uSpriteBlockXY, e.x, e.y);
+            gl.uniform2f(sLoc.uFacingCS, Math.cos(e.facing), Math.sin(e.facing));
+            gl.uniform1i(sLoc.uIsShadow, 1);
+            gl.uniform1f(sLoc.uShadowAlpha, 0.34 * shScale * Math.max(0.25, sunBrightness));
+            gl.uniform1f(sLoc.uSpriteSizeBlocks, e.shadowSize * shScale);
+            gl.uniform1i(sLoc.uSliceZ, z);
+            gl.uniform1i(sLoc.uShowBox, 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+            miscDrawCalls++;
+          }
+        }
+
+        // 3. このスライスのプレイヤー＆羊モブ本体
+        for (let i = 0; i < entities.length; i++) {
+          const e = entities[i];
+          if (z >= e.baseSlice && z < e.baseSlice + e.sliceCount) {
+            useSpriteProgram(e.tex);
+            gl.uniform2f(sLoc.uSpriteBlockXY, e.x, e.y);
+            gl.uniform2f(sLoc.uFacingCS, Math.cos(e.facing), Math.sin(e.facing));
+            gl.uniform3f(sLoc.uPlayerTint, e.tint[0], e.tint[1], e.tint[2]);
+            gl.uniform1i(sLoc.uIsShadow, 0);
+            gl.uniform1i(sLoc.uPlayerLayer, e.poseIdx * e.sliceCount + (z - e.baseSlice));
+            gl.uniform1f(sLoc.uSpriteSizeBlocks, e.sizeBlocks);
+            gl.uniform1i(sLoc.uSliceZ, z);
+            gl.uniform1i(sLoc.uShowBox, e.isPlayer && settings.showWireframe && (z - e.baseSlice) % 3 === 0 ? 1 : 0);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+            miscDrawCalls++;
+          }
+        }
+
+        // 4. このスライスの水・松明・煙・草花
         drawWorldBatch(z, 1, 2);
+
+        runStart = z + 1;
       }
 
-      if (pEnd < limitZ) {
-        drawWorldBatch(pEnd, limitZ - pEnd, 0);
+      if (runStart < limitZ) {
+        drawWorldBatch(runStart, limitZ - runStart, 0);
       }
 
       // 高さ 19..22 (最大3段 = 24+1=25スライス) の 1×1×1 雲ブロック集合体（1ドローコール）

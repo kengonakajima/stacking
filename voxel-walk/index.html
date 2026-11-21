@@ -8,7 +8,6 @@
 </head>
 <body>
   <div class="app-layout">
-    <!-- 左側: ボクセルワールド画面 -->
     <main class="viewport-pane">
       <header class="hud-bar">
         <div class="hud-left">
@@ -45,243 +44,20 @@
 
       <div class="canvas-stage">
         <canvas id="world-canvas"></canvas>
-        <div class="floating-hint">
-          東へ進むとスパゲッティ洞窟の入口 ／ 洞窟に入ると遮蔽ブロックが自動で輪郭線・半透明になります
-        </div>
       </div>
 
       <footer class="controls-bar">
         <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / <kbd>↑↓←→</kbd> 歩く</span>
-        <span><kbd>Space</kbd> ジャンプ / 泳ぐ</span>
+        <span><kbd>Space</kbd> 2段ジャンプ / 泳ぐ</span>
+        <span><kbd>クリック</kbd> ブロック破壊</span>
         <span><kbd>F</kbd> 松明を置く</span>
         <span><kbd>X</kbd> 松明を回収</span>
         <span><kbd>Q</kbd> / <kbd>E</kbd> 回転</span>
         <span><kbd>ドラッグ</kbd> 自由視点</span>
+        <span><kbd>ホイール</kbd> ズーム</span>
         <span><kbd>R</kbd> 初期位置</span>
       </footer>
     </main>
-
-    <!-- 右側: 描画統計・ワールド制御・モデル観察パネル -->
-    <aside class="inspector-pane">
-      <!-- 0. 描画パフォーマンス統計 -->
-      <section class="panel-section">
-        <div class="section-header">
-          <h2>1. 描画統計（パフォーマンス）</h2>
-          <span class="hint">リアルタイム計測</span>
-        </div>
-        <div class="perf-grid">
-          <div class="perf-card">
-            <span class="perf-label">フレームレート</span>
-            <span id="stat-fps" class="perf-val perf-accent">60.0 fps</span>
-          </div>
-          <div class="perf-card">
-            <span class="perf-label">描画時間 / Frame</span>
-            <span id="stat-render-ms" class="perf-val">0.00 ms</span>
-          </div>
-          <div class="perf-card">
-            <span class="perf-label">ドローコール数</span>
-            <span id="stat-draw-total" class="perf-val perf-sky">0 calls</span>
-          </div>
-          <div class="perf-card">
-            <span class="perf-label">水流計算 / Step</span>
-            <span id="stat-water-ms" class="perf-val">0.00 ms</span>
-          </div>
-        </div>
-        <div class="perf-rows">
-          <div class="perf-row">
-            <span>内訳 (Calls)</span>
-            <span id="stat-draw-break" class="mono-sub">地形 0 / 水 0 / 他 0</span>
-          </div>
-          <div class="perf-row">
-            <span>描画スライス数</span>
-            <span id="stat-slices" class="mono-sub">0 / 0</span>
-          </div>
-          <div class="perf-row">
-            <span>画面内クロップ面積</span>
-            <span id="stat-crop" class="mono-sub">100%</span>
-          </div>
-          <div class="perf-row">
-            <span>ワールド規模</span>
-            <span id="stat-world-meta" class="mono-sub">128×128×12</span>
-          </div>
-        </div>
-        <div class="control-block" style="margin-top:8px; margin-bottom:0;">
-          <div class="control-label-row">
-            <span>描画解像度（WebGL2 内部解像度）</span>
-            <span id="val-render-scale" class="mono-val">1.00x</span>
-          </div>
-          <div class="preset-row">
-            <button class="chip-btn" data-rscale="0.5">0.5x (ドット調)</button>
-            <button class="chip-btn" data-rscale="0.75">0.75x</button>
-            <button class="chip-btn active" data-rscale="1">1.0x (高精細)</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- 2. ワールド＆水流コントロール -->
-      <section class="panel-section">
-        <div class="section-header">
-          <h2>2. 128×128 ワールド &amp; 水流</h2>
-          <span class="hint">リアルタイム反映</span>
-        </div>
-
-        <div class="control-block">
-          <div class="control-label-row">
-            <label for="slider-time">昼夜サイクル（時刻）</label>
-            <span id="val-time" class="mono-val">05:30 (朝)</span>
-          </div>
-          <input id="slider-time" type="range" min="0" max="24" step="0.1" value="5.5" />
-          <div class="preset-row">
-            <button class="chip-btn" data-time="5.9">朝</button>
-            <button class="chip-btn" data-time="12.0">昼</button>
-            <button class="chip-btn" data-time="19.1">夕方</button>
-            <button class="chip-btn" data-time="0.0">夜 (真っ暗)</button>
-            <label class="inline-check" style="margin-left:auto;">
-              <input id="chk-auto-time" type="checkbox" checked />
-              <span>時間経過</span>
-            </label>
-          </div>
-        </div>
-
-        <div class="control-block">
-          <div class="control-label-row">
-            <span>光源（16ブロック到達・明るさ15）</span>
-            <span id="val-light-info" class="mono-val">光 0/15 · 空 15/15</span>
-          </div>
-          <div class="preset-row">
-            <button id="btn-place-torch" class="chip-btn chip-torch">🔥 松明を置く (F)</button>
-            <button id="btn-remove-torch" class="chip-btn">松明を回収 (X)</button>
-          </div>
-        </div>
-
-        <div class="control-block">
-          <div class="control-label-row">
-            <span>水の総量（内部64段階保存）</span>
-            <span id="val-water-total" class="mono-val">57600 / 57600 (流動中)</span>
-          </div>
-          <div class="preset-row">
-            <button id="btn-goto-spring" class="chip-btn chip-accent">⛲ 山の泉へ移動</button>
-            <button id="btn-goto-cave" class="chip-btn chip-accent">🕳 洞窟の入口へ移動</button>
-            <button id="btn-reflow-water" class="chip-btn">💧 水を流し直す</button>
-            <button id="btn-regen-world" class="chip-btn">🏔 新しい地形</button>
-          </div>
-        </div>
-
-        <div class="control-block">
-          <div class="control-label-row">
-            <span>遮蔽ブロック透視（洞窟・崖裏）</span>
-            <span id="badge-occlusion" class="occlusion-badge">待機中（視界良好）</span>
-          </div>
-          <div class="preset-row" style="margin-bottom:6px;">
-            <button class="chip-btn active" data-xray="0">地形輪郭のみ</button>
-            <button class="chip-btn" data-xray="1">うっすら半透明</button>
-            <button class="chip-btn" data-xray="2">完全切り抜き</button>
-          </div>
-          <div class="control-label-row">
-            <label for="slider-xray-radius">透視窓の広さ</label>
-            <span id="val-xray-radius" class="mono-val">5.0 blk</span>
-          </div>
-          <input id="slider-xray-radius" type="range" min="2.5" max="9.0" step="0.5" value="5.0" />
-        </div>
-
-        <div class="control-block">
-          <div class="control-label-row">
-            <label for="slider-spacing">スライス間隔（Z倍率）</label>
-            <span id="val-spacing" class="mono-val">1.00x</span>
-          </div>
-          <input id="slider-spacing" type="range" min="0" max="2.5" step="0.05" value="1.0" />
-          <div class="preset-row">
-            <button class="chip-btn" data-spacing="0">0x (平面2D)</button>
-            <button class="chip-btn active" data-spacing="1">1.0x (立方体)</button>
-            <button class="chip-btn" data-spacing="2">2.0x (層分解)</button>
-          </div>
-        </div>
-
-        <div class="control-block">
-          <div class="control-label-row">
-            <label for="slider-cutaway">高さカット（トンネル内部も観察）</label>
-            <span id="val-cutaway" class="mono-val">全層</span>
-          </div>
-          <input id="slider-cutaway" type="range" min="1" max="97" step="1" value="97" />
-          <div class="preset-row">
-            <button id="btn-buildup" class="chip-btn chip-accent">▶ 下から積み上げ再生</button>
-            <button id="btn-cutaway-full" class="chip-btn">全層表示</button>
-          </div>
-        </div>
-
-        <div class="control-block">
-          <div class="control-label-row">
-            <label for="slider-yaw">カメラ水平角（Yaw）</label>
-            <span id="val-yaw" class="mono-val">45°</span>
-          </div>
-          <input id="slider-yaw" type="range" min="-180" max="180" step="1" value="45" />
-        </div>
-
-        <div class="control-block">
-          <div class="control-label-row">
-            <label for="slider-pitch">カメラ仰角（Pitch / 傾き）</label>
-            <span id="val-pitch" class="mono-val">45°</span>
-          </div>
-          <input id="slider-pitch" type="range" min="25" max="85" step="1" value="45" />
-          <div class="preset-row">
-            <button class="chip-btn" data-pitch="32">斜め低め (32°)</button>
-            <button class="chip-btn active" data-pitch="45">標準 (45°)</button>
-            <button class="chip-btn" data-pitch="80">真上寄り (80°)</button>
-          </div>
-        </div>
-
-        <div class="toggle-grid">
-          <label class="toggle-item">
-            <input id="chk-ao" type="checkbox" checked />
-            <span>3D陰影・AO</span>
-          </label>
-          <label class="toggle-item">
-            <input id="chk-edge" type="checkbox" checked />
-            <span>段差エッジ強調</span>
-          </label>
-          <label class="toggle-item">
-            <input id="chk-pixelated" type="checkbox" checked />
-            <span>ドットくっきり</span>
-          </label>
-          <label class="toggle-item">
-            <input id="chk-wireframe" type="checkbox" />
-            <span>スライス枠を表示</span>
-          </label>
-          <label class="toggle-item">
-            <input id="chk-clouds" type="checkbox" checked />
-            <span>雲と雲の影 (高さ20)</span>
-          </label>
-        </div>
-      </section>
-
-      <!-- 3. 単体モデル分解プレビュー -->
-      <section class="panel-section">
-        <div class="section-header">
-          <h2>3. 単体モデル分解プレビュー</h2>
-          <span class="hint">各ブロックの2Dスライス</span>
-        </div>
-
-        <div class="model-tabs" id="model-tabs">
-          <button class="tab-btn active" data-model="grass">草ブロック</button>
-          <button class="tab-btn" data-model="stone">岩ブロック</button>
-          <button class="tab-btn" data-model="lava">溶岩(光15)</button>
-          <button class="tab-btn" data-model="wood">木の幹</button>
-          <button class="tab-btn" data-model="water">水 (8段階)</button>
-          <button class="tab-btn" data-model="player">プレイヤー</button>
-        </div>
-
-        <div class="preview-box">
-          <canvas id="preview-canvas" width="320" height="150"></canvas>
-          <div class="preview-caption" id="preview-caption">草ブロック：8枚の2D断面を積み上げ</div>
-        </div>
-
-        <div class="sheet-header">
-          <span>2Dスライス一覧（底 Z=0 → 頂上）</span>
-          <span id="hover-layer-info" class="layer-badge">層にカーソルで強調</span>
-        </div>
-        <div id="slice-grid" class="slice-grid"></div>
-      </section>
-    </aside>
   </div>
 
   <script defer src="js/blocks.js"></script>

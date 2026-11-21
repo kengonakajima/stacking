@@ -9,12 +9,11 @@
 
   const {
     BLOCK_AIR,
+    BLOCK_SIZE,
     BLOCK_SLICES,
     BLOCK_NAMES,
-    PREVIEW_MODELS,
     createWorld,
     createWebGLRenderer,
-    drawSingleModelPreview,
   } = global.VoxelWalk;
 
   function makeRandomSeed() {
@@ -72,17 +71,7 @@
   };
 
   const keys = Object.create(null);
-  const drag = { active: false, lastX: 0, lastY: 0 };
-
-  const preview = {
-    modelId: "grass",
-    angle: Math.PI / 4,
-    dragging: false,
-    lastDragX: 0,
-    highlightLayer: null,
-    buildupTimer: null,
-    sliceCells: [],
-  };
+  const drag = { active: false, lastX: 0, lastY: 0, downX: 0, downY: 0, moved: 0 };
 
   // ============================================================
   // DOM 要素取得
@@ -90,8 +79,6 @@
   const viewportPane = document.querySelector(".viewport-pane");
   const worldCanvas = document.getElementById("world-canvas");
   const glRenderer = createWebGLRenderer(worldCanvas);
-  const previewCanvas = document.getElementById("preview-canvas");
-  const previewCtx = previewCanvas.getContext("2d");
 
   const hudFps = document.getElementById("hud-fps");
   const hudTime = document.getElementById("hud-time");
@@ -101,69 +88,6 @@
   const btnPlaceTorchHud = document.getElementById("btn-place-torch-hud");
   const btnResetPos = document.getElementById("btn-reset-pos");
   const btnResetCam = document.getElementById("btn-reset-cam");
-
-  // 描画統計パネル要素
-  const statFps = document.getElementById("stat-fps");
-  const statRenderMs = document.getElementById("stat-render-ms");
-  const statDrawTotal = document.getElementById("stat-draw-total");
-  const statDrawBreak = document.getElementById("stat-draw-break");
-  const statSlices = document.getElementById("stat-slices");
-  const statCrop = document.getElementById("stat-crop");
-  const statWaterMs = document.getElementById("stat-water-ms");
-  const statWorldMeta = document.getElementById("stat-world-meta");
-  const valRenderScale = document.getElementById("val-render-scale");
-
-  const modelTabs = document.getElementById("model-tabs");
-  const previewCaption = document.getElementById("preview-caption");
-  const hoverLayerInfo = document.getElementById("hover-layer-info");
-  const sliceGrid = document.getElementById("slice-grid");
-
-  const valWaterTotal = document.getElementById("val-water-total");
-  const btnReflowWater = document.getElementById("btn-reflow-water");
-  const btnRegenWorld = document.getElementById("btn-regen-world");
-  const btnGotoCave = document.getElementById("btn-goto-cave");
-  const btnGotoSpring = document.getElementById("btn-goto-spring");
-  const btnPlaceTorch = document.getElementById("btn-place-torch");
-  const btnRemoveTorch = document.getElementById("btn-remove-torch");
-  const valLightInfo = document.getElementById("val-light-info");
-  const sliderTime = document.getElementById("slider-time");
-  const valTime = document.getElementById("val-time");
-  const chkAutoTime = document.getElementById("chk-auto-time");
-  const sliderXrayRadius = document.getElementById("slider-xray-radius");
-  const valXrayRadius = document.getElementById("val-xray-radius");
-  const badgeOcclusion = document.getElementById("badge-occlusion");
-
-  const sliderSpacing = document.getElementById("slider-spacing");
-  const valSpacing = document.getElementById("val-spacing");
-  const sliderCutaway = document.getElementById("slider-cutaway");
-  const valCutaway = document.getElementById("val-cutaway");
-  const btnBuildup = document.getElementById("btn-buildup");
-  const btnCutawayFull = document.getElementById("btn-cutaway-full");
-  const sliderYaw = document.getElementById("slider-yaw");
-  const valYaw = document.getElementById("val-yaw");
-  const sliderPitch = document.getElementById("slider-pitch");
-  const valPitch = document.getElementById("val-pitch");
-
-  const chkAO = document.getElementById("chk-ao");
-  const chkEdge = document.getElementById("chk-edge");
-  const chkPixelated = document.getElementById("chk-pixelated");
-  const chkWireframe = document.getElementById("chk-wireframe");
-  const chkClouds = document.getElementById("chk-clouds");
-
-  function updateWaterHud() {
-    const cur = world.computeCurrentTotalWater();
-    const status = world.springCount > 0 ? `泉${world.springCount}ヶ所 湧出中` : (world.isWaterSettled() ? "静止" : "流動中");
-    valWaterTotal.textContent = `${cur} (${status})`;
-  }
-
-  function syncWorldMeta() {
-    sliderCutaway.max = String(world.maxUsedSlice);
-    settings.maxVisibleSlice = world.maxUsedSlice;
-    sliderCutaway.value = String(world.maxUsedSlice);
-    valCutaway.textContent = `${world.maxUsedSlice} / ${world.maxUsedSlice}`;
-    statWorldMeta.textContent = `Seed ${world.seed} · 泉 ${world.springCount} / 溶岩 ${world.lavaPoolCount} (ベイク ${world.initialBakeMs.toFixed(0)}ms)`;
-    updateWaterHud();
-  }
 
   // ============================================================
   // 昼夜サイクル計算（時刻 0..24h → 太陽光強度・空色・背景グラデーション）
@@ -241,10 +165,7 @@
     const hh = String(Math.floor(h)).padStart(2, "0");
     const mm = String(Math.floor((h - Math.floor(h)) * 60)).padStart(2, "0");
     const label = h >= 20 || h < 5 ? "夜" : h >= 18 ? "夕" : h < 7 ? "朝" : "昼";
-    const timeText = `${hh}:${mm} (${label})`;
-    hudTime.textContent = timeText;
-    valTime.textContent = timeText;
-    sliderTime.value = h.toFixed(2);
+    hudTime.textContent = `${hh}:${mm} (${label})`;
 
     const bgKey = `${bgTop[0]},${bgTop[1]},${bgBot[0]},${bgBot[1]}`;
     if (bgKey !== lastBgKey && viewportPane) {
@@ -371,36 +292,6 @@
     camera.yaw = Math.PI / 4;
     camera.pitchDeg = 45;
     camera.zoom = 4.0;
-    syncCameraUI();
-  }
-
-  function regenerateWorld() {
-    if (preview.buildupTimer) {
-      clearInterval(preview.buildupTimer);
-      preview.buildupTimer = null;
-    }
-    worldSeed = makeRandomSeed();
-    world = createWorld(worldSeed);
-    syncWorldMeta();
-    resetPlayerPosition();
-  }
-
-  function normalizeDeg(deg) {
-    return (((deg + 180) % 360) + 360) % 360 - 180;
-  }
-
-  function syncCameraUI() {
-    const yawDeg = normalizeDeg(Math.round((camera.yaw * 180) / Math.PI));
-    const pitchDeg = Math.round(camera.pitchDeg);
-    sliderYaw.value = String(yawDeg);
-    valYaw.textContent = `${yawDeg}°`;
-    sliderPitch.value = String(pitchDeg);
-    valPitch.textContent = `${pitchDeg}°`;
-
-    document.querySelectorAll("[data-pitch]").forEach((btn) => {
-      const v = parseFloat(btn.dataset.pitch);
-      btn.classList.toggle("active", Math.abs(v - pitchDeg) <= 1);
-    });
   }
 
   // ============================================================
@@ -410,11 +301,9 @@
     const yawSpeed = 1.7;
     if (keys["KeyQ"]) {
       camera.yaw -= yawSpeed * dt;
-      syncCameraUI();
     }
     if (keys["KeyE"]) {
       camera.yaw += yawSpeed * dt;
-      syncCameraUI();
     }
 
     const wFeet = world.getWaterLevelAt(player.x, player.y, player.z + 0.08);
@@ -545,163 +434,99 @@
     if (Math.abs(settings.occlusionFade - targetFade) < 0.005) {
       settings.occlusionFade = targetFade;
     }
-    badgeOcclusion.textContent = occluded ? "透視ON（遮蔽中）" : "待機中（視界良好）";
-    badgeOcclusion.classList.toggle("active", occluded);
-
-    // 現在位置の明るさ (0..15) と松明本数を表示
-    const curLight = world.getLightAt(player.x, player.y, player.z + 0.3);
-    valLightInfo.textContent = `光 ${curLight.block}/15 · 空 ${curLight.sky}/15 (松明 ${world.getTorchCount()}本)`;
   }
 
   // ============================================================
-  // 右パネル: 単体モデルプレビュー & スライスシート
+  // 画面クリック位置から 3D ボクセルブロックを厳密レイキャストして1発破壊
   // ============================================================
-  function rebuildSliceGrid() {
-    const model = PREVIEW_MODELS[preview.modelId];
-    sliceGrid.innerHTML = "";
-    preview.sliceCells = [];
+  function pickBlockAtClientPos(clientX, clientY) {
+    const rect = worldCanvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const rScale = settings.renderScale || 1.0;
+    const clickX = (clientX - rect.left) * (worldCanvas.width / rect.width);
+    const clickY = (clientY - rect.top) * (worldCanvas.height / rect.height);
 
-    for (let z = 0; z < model.layerCount; z++) {
-      const cell = document.createElement("div");
-      cell.className = "slice-cell";
+    const viewW = worldCanvas.width;
+    const viewH = worldCanvas.height;
+    const effZoom = camera.zoom * rScale;
+    const centerX = viewW * 0.5;
+    const centerY = viewH * 0.5 + 12 * rScale;
 
-      const thumb = document.createElement("canvas");
-      thumb.width = model.width;
-      thumb.height = model.height;
-      const tCtx = thumb.getContext("2d");
-      tCtx.imageSmoothingEnabled = false;
-      tCtx.drawImage(model.canvases[z], 0, 0);
-
-      const label = document.createElement("span");
-      label.textContent = `Z=${z}`;
-
-      cell.appendChild(thumb);
-      cell.appendChild(label);
-
-      cell.addEventListener("mouseenter", () => {
-        preview.highlightLayer = z;
-        cell.classList.add("highlighted");
-        hoverLayerInfo.textContent = `Z=${z} / ${model.layerCount - 1}`;
-      });
-      cell.addEventListener("mouseleave", () => {
-        preview.highlightLayer = null;
-        cell.classList.remove("highlighted");
-        hoverLayerInfo.textContent = "層にカーソルで強調";
-      });
-
-      sliceGrid.appendChild(cell);
-      preview.sliceCells.push(cell);
-    }
-
-    previewCaption.textContent = `${model.name}：${model.layerCount}枚の2Dスライス（Z倍率 ${settings.sliceSpacingMult.toFixed(2)}x）`;
-  }
-
-  function renderPreview(dt) {
-    if (!preview.dragging) {
-      preview.angle += dt * 0.75;
-    }
-
-    const model = PREVIEW_MODELS[preview.modelId];
-    const w = previewCanvas.width;
-    const h = previewCanvas.height;
-    previewCtx.clearRect(0, 0, w, h);
-
-    const scale = model.id === "player" ? 5.6 : 7.8;
     const pitchRad = (camera.pitchDeg * Math.PI) / 180;
-    const unitScale = model.id === "player" ? 1.0 : 6 / 8;
-    const totalLift = (model.layerCount - 1) * Math.cos(pitchRad) * scale * unitScale * settings.sliceSpacingMult;
-    const baseY = Math.min(h - 24, h / 2 + totalLift * 0.48 + 10);
+    const squashY = Math.sin(pitchRad);
+    const sliceUnitScale = BLOCK_SIZE / BLOCK_SLICES;
+    const liftPerSlice = Math.cos(pitchRad) * effZoom * sliceUnitScale * settings.sliceSpacingMult;
+    const blockScreenPx = BLOCK_SIZE * effZoom;
+    const cosYaw = Math.cos(camera.yaw);
+    const sinYaw = Math.sin(camera.yaw);
+    const camBaseSlice = camera.z * BLOCK_SLICES;
 
-    drawSingleModelPreview(previewCtx, model, {
-      x: w / 2,
-      y: baseY,
-      angle: preview.angle,
-      pitchDeg: camera.pitchDeg,
-      scale,
-      sliceSpacingMult: settings.sliceSpacingMult,
-      pixelated: settings.pixelated,
-      showWireframe: settings.showWireframe,
-      highlightLayer: preview.highlightLayer,
-    });
-  }
+    // 透視モード中はカットされている屋根スライスを貫通して洞窟内部のブロックを掘れるようにする
+    const pRelX = (player.x - camera.x) * blockScreenPx;
+    const pRelY = (player.y - camera.y) * blockScreenPx;
+    const pScreenX = centerX + (pRelX * cosYaw - pRelY * sinYaw);
+    const pBodySlice = player.z * BLOCK_SLICES + 6.2;
+    const pScreenY =
+      centerY - (pBodySlice - camBaseSlice) * liftPerSlice + (pRelX * sinYaw + pRelY * cosYaw) * squashY;
+    const clickDistToPlayer = Math.hypot(clickX - pScreenX, clickY - pScreenY);
+    const xrayRadiusPx = (settings.xrayRadiusBlocks || 5.0) * blockScreenPx;
+    const playerBaseSlice = Math.round(player.z * BLOCK_SLICES);
+    const xrayActive = settings.occlusionFade > 0.35 && clickDistToPlayer < xrayRadiusPx;
+    const xrayCutSlice = clickDistToPlayer < blockScreenPx * 1.35 ? playerBaseSlice + 4 : playerBaseSlice + 12;
 
-  // ============================================================
-  // UI イベント配線
-  // ============================================================
-  function setSpacingMult(val) {
-    settings.sliceSpacingMult = val;
-    sliderSpacing.value = String(val);
-    valSpacing.textContent = `${val.toFixed(2)}x`;
-    document.querySelectorAll("[data-spacing]").forEach((btn) => {
-      const v = parseFloat(btn.dataset.spacing);
-      btn.classList.toggle("active", Math.abs(v - val) < 0.04);
-    });
-    const model = PREVIEW_MODELS[preview.modelId];
-    previewCaption.textContent = `${model.name}：${model.layerCount}枚の2Dスライス（Z倍率 ${val.toFixed(2)}x）`;
-  }
+    const topSlice = Math.min(world.maxUsedSlice - 1, settings.maxVisibleSlice - 1);
+    const rx = clickX - centerX;
+    for (let s = topSlice; s >= 0; s--) {
+      if (xrayActive && s >= xrayCutSlice) continue;
+      const ryUnsq = (clickY - centerY + (s - camBaseSlice) * liftPerSlice) / Math.max(0.15, squashY);
+      const bx = Math.floor(camera.x + (rx * cosYaw + ryUnsq * sinYaw) / blockScreenPx);
+      const by = Math.floor(camera.y + (-rx * sinYaw + ryUnsq * cosYaw) / blockScreenPx);
+      if (bx < 0 || by < 0 || bx >= world.sizeX || by >= world.sizeY) continue;
 
-  function setCutaway(sliceCount) {
-    settings.maxVisibleSlice = sliceCount;
-    sliderCutaway.value = String(sliceCount);
-    valCutaway.textContent = `${sliceCount} / ${world.maxUsedSlice}`;
-  }
-
-  function startBuildupAnimation() {
-    if (preview.buildupTimer) {
-      clearInterval(preview.buildupTimer);
-      preview.buildupTimer = null;
-    }
-    let current = 1;
-    setCutaway(current);
-    preview.buildupTimer = setInterval(() => {
-      current += 2;
-      if (current >= world.maxUsedSlice) {
-        clearInterval(preview.buildupTimer);
-        preview.buildupTimer = null;
-        setCutaway(world.maxUsedSlice);
-        return;
+      const bz = Math.floor(s / BLOCK_SLICES);
+      const lz = s - bz * BLOCK_SLICES;
+      if (bz < world.sizeZ && world.getBlock(bx, by, bz) !== BLOCK_AIR) {
+        return { x: bx, y: by, z: bz };
       }
-      setCutaway(current);
-    }, 45);
+      if (lz === 0 && bz > 0 && world.getBlock(bx, by, bz - 1) !== BLOCK_AIR) {
+        return { x: bx, y: by, z: bz - 1 };
+      }
+    }
+    return null;
   }
 
-  modelTabs.addEventListener("click", (ev) => {
-    const btn = ev.target.closest("[data-model]");
-    if (!btn) return;
-    preview.modelId = btn.dataset.model;
-    modelTabs.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
-    preview.highlightLayer = null;
-    rebuildSliceGrid();
-  });
-
-  previewCanvas.addEventListener("mousedown", (ev) => {
-    preview.dragging = true;
-    preview.lastDragX = ev.clientX;
-  });
-
+  // ============================================================
+  // 入力・UI イベント配線
+  // ============================================================
   worldCanvas.addEventListener("mousedown", (ev) => {
+    if (ev.button !== 0) return;
     drag.active = true;
     drag.lastX = ev.clientX;
     drag.lastY = ev.clientY;
+    drag.downX = ev.clientX;
+    drag.downY = ev.clientY;
+    drag.moved = 0;
   });
   window.addEventListener("mousemove", (ev) => {
-    if (preview.dragging) {
-      const dx = ev.clientX - preview.lastDragX;
-      preview.lastDragX = ev.clientX;
-      preview.angle += dx * 0.02;
-    }
     if (drag.active) {
       const dx = ev.clientX - drag.lastX;
       const dy = ev.clientY - drag.lastY;
       drag.lastX = ev.clientX;
       drag.lastY = ev.clientY;
-      camera.yaw += dx * 0.008;
-      camera.pitchDeg = Math.max(25, Math.min(85, camera.pitchDeg + dy * 0.28));
-      syncCameraUI();
+      drag.moved += Math.hypot(dx, dy);
+      if (drag.moved > 4) {
+        camera.yaw += dx * 0.008;
+        camera.pitchDeg = Math.max(25, Math.min(85, camera.pitchDeg + dy * 0.28));
+      }
     }
   });
-  window.addEventListener("mouseup", () => {
-    preview.dragging = false;
+  window.addEventListener("mouseup", (ev) => {
+    if (drag.active && drag.moved <= 5) {
+      const hit = pickBlockAtClientPos(ev.clientX, ev.clientY);
+      if (hit) {
+        world.destroyBlockAt(hit.x, hit.y, hit.z);
+      }
+    }
     drag.active = false;
   });
 
@@ -715,126 +540,13 @@
     { passive: false }
   );
 
-  document.querySelectorAll("[data-rscale]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      settings.renderScale = parseFloat(btn.dataset.rscale);
-      valRenderScale.textContent = `${settings.renderScale.toFixed(2)}x`;
-      document.querySelectorAll("[data-rscale]").forEach((b) => {
-        b.classList.toggle("active", b === btn);
-      });
-      resizeWorldCanvas();
-    });
-  });
-
-  sliderSpacing.addEventListener("input", () => setSpacingMult(parseFloat(sliderSpacing.value)));
-  document.querySelectorAll("[data-spacing]").forEach((btn) => {
-    btn.addEventListener("click", () => setSpacingMult(parseFloat(btn.dataset.spacing)));
-  });
-
-  sliderCutaway.addEventListener("input", () => {
-    if (preview.buildupTimer) {
-      clearInterval(preview.buildupTimer);
-      preview.buildupTimer = null;
-    }
-    setCutaway(parseInt(sliderCutaway.value, 10));
-  });
-  btnBuildup.addEventListener("click", startBuildupAnimation);
-  btnCutawayFull.addEventListener("click", () => {
-    if (preview.buildupTimer) {
-      clearInterval(preview.buildupTimer);
-      preview.buildupTimer = null;
-    }
-    setCutaway(world.maxUsedSlice);
-  });
-
-  btnReflowWater.addEventListener("click", () => {
-    world.resetWaterToHighlands();
-    updateWaterHud();
-  });
-  btnRegenWorld.addEventListener("click", regenerateWorld);
-  btnGotoCave.addEventListener("click", () => {
-    player.x = world.caveEntranceX;
-    player.y = world.caveEntranceY;
-    player.z = world.caveEntranceZ;
-    player.vz = 0;
-    player.facing = 0;
-    camera.x = player.x;
-    camera.y = player.y;
-    camera.z = player.z;
-  });
-  btnGotoSpring.addEventListener("click", () => {
-    player.x = world.springViewX;
-    player.y = world.springViewY;
-    player.z = world.springViewZ;
-    player.vz = 0;
-    player.facing = 0;
-    camera.x = player.x;
-    camera.y = player.y;
-    camera.z = player.z;
-  });
-
   function placeTorchAtPlayer() {
     // まず足元、埋まっていれば1歩前方へ設置
     if (world.placeTorchAt(player.x, player.y, player.z + 0.1)) return;
     world.placeTorchAt(player.x + Math.cos(player.facing) * 0.9, player.y + Math.sin(player.facing) * 0.9, player.z + 0.1);
   }
 
-  btnPlaceTorch.addEventListener("click", placeTorchAtPlayer);
   btnPlaceTorchHud.addEventListener("click", placeTorchAtPlayer);
-  btnRemoveTorch.addEventListener("click", () => {
-    world.removeTorchNear(player.x, player.y, player.z + 0.3);
-  });
-
-  sliderTime.addEventListener("input", () => {
-    settings.timeOfDay = parseFloat(sliderTime.value);
-    updateDayNightLighting();
-  });
-  document.querySelectorAll("[data-time]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      settings.timeOfDay = parseFloat(btn.dataset.time);
-      updateDayNightLighting();
-    });
-  });
-  chkAutoTime.addEventListener("change", () => {
-    settings.autoTime = chkAutoTime.checked;
-  });
-
-  document.querySelectorAll("[data-xray]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      settings.xrayMode = parseInt(btn.dataset.xray, 10);
-      document.querySelectorAll("[data-xray]").forEach((b) => {
-        b.classList.toggle("active", b === btn);
-      });
-    });
-  });
-
-  sliderXrayRadius.addEventListener("input", () => {
-    settings.xrayRadiusBlocks = parseFloat(sliderXrayRadius.value);
-    valXrayRadius.textContent = `${settings.xrayRadiusBlocks.toFixed(1)} blk`;
-  });
-
-  sliderYaw.addEventListener("input", () => {
-    const deg = parseFloat(sliderYaw.value);
-    camera.yaw = (deg * Math.PI) / 180;
-    syncCameraUI();
-  });
-  sliderPitch.addEventListener("input", () => {
-    camera.pitchDeg = parseFloat(sliderPitch.value);
-    syncCameraUI();
-  });
-  document.querySelectorAll("[data-pitch]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      camera.pitchDeg = parseFloat(btn.dataset.pitch);
-      syncCameraUI();
-    });
-  });
-
-  chkAO.addEventListener("change", () => (settings.useAO = chkAO.checked));
-  chkEdge.addEventListener("change", () => (settings.useEdgeHighlight = chkEdge.checked));
-  chkPixelated.addEventListener("change", () => (settings.pixelated = chkPixelated.checked));
-  chkWireframe.addEventListener("change", () => (settings.showWireframe = chkWireframe.checked));
-  chkClouds.addEventListener("change", () => (settings.showClouds = chkClouds.checked));
-
   btnResetPos.addEventListener("click", resetPlayerPosition);
   btnResetCam.addEventListener("click", resetCameraView);
 
@@ -864,18 +576,15 @@
   window.addEventListener("resize", resizeWorldCanvas);
 
   // ============================================================
-  // メインループ ＋ リアルタイム描画統計計測
+  // メインループ
   // ============================================================
   let lastTime = performance.now();
   let waterAccum = 0;
-  let lastWaterStepMs = 0;
 
   let fpsFrames = 0;
   let fpsWindowStart = performance.now();
   let currentFps = 60;
-  let smoothRenderMs = 0;
   let statsUiTimer = 0;
-  let previewToggle = 0;
 
   function tick(now) {
     const rawDt = (now - lastTime) / 1000;
@@ -901,46 +610,24 @@
     updateDayNightLighting();
 
     updatePlayer(dt);
+    world.updateSheep(dt, player);
     world.updateTrees(dt, now * 0.001, player);
 
-    // 水流ステップ計測
+    // 水流ステップ
     waterAccum += dt;
     if (waterAccum >= 0.085) {
       waterAccum = 0;
-      if (world.isWaterSettled()) {
-        lastWaterStepMs = 0;
-      } else {
-        const wt0 = performance.now();
+      if (!world.isWaterSettled()) {
         world.stepWater();
-        lastWaterStepMs = performance.now() - wt0;
       }
-      updateWaterHud();
     }
 
-    const rStats = glRenderer.render(world, player, camera, settings, now * 0.001);
-    smoothRenderMs = smoothRenderMs === 0 ? rStats.renderMs : smoothRenderMs * 0.85 + rStats.renderMs * 0.15;
+    glRenderer.render(world, player, camera, settings, now * 0.001);
 
-    // 右側単体プレビューは30fps間引き
-    previewToggle ^= 1;
-    if (previewToggle || preview.dragging) {
-      renderPreview(dt * (preview.dragging ? 1 : 2));
-    }
-
-    // 描画統計 UI を約 8Hz で更新
     statsUiTimer += dt;
     if (statsUiTimer >= 0.12) {
       statsUiTimer = 0;
-      const fpsStr = `${currentFps.toFixed(1)} fps`;
       hudFps.textContent = `${Math.round(currentFps)} fps`;
-      statFps.textContent = fpsStr;
-      statRenderMs.textContent = `${smoothRenderMs.toFixed(2)} ms`;
-      statDrawTotal.textContent = `${rStats.totalDrawCalls} calls (${rStats.backend})`;
-      statDrawBreak.textContent = `地形 ${rStats.worldDrawCalls} / 水 ${rStats.waterDrawCalls} / 他 ${rStats.miscDrawCalls}`;
-      statSlices.textContent = `${rStats.drawnSlices} / ${rStats.totalSlices} 層 (Instanced)`;
-      statCrop.textContent = `${Math.round(rStats.cropRatio * 100)}% (${worldCanvas.width}×${worldCanvas.height})`;
-      statWaterMs.textContent = world.isWaterSettled()
-        ? "0.00 ms (静止)"
-        : `${lastWaterStepMs.toFixed(2)} ms`;
     }
 
     requestAnimationFrame(tick);
@@ -948,9 +635,6 @@
 
   // 起動
   resizeWorldCanvas();
-  syncWorldMeta();
-  rebuildSliceGrid();
-  syncCameraUI();
   resetPlayerPosition();
   requestAnimationFrame(tick);
 })(window);

@@ -655,6 +655,189 @@
     rawStepB: poseStepB.rawSlices,
   };
 
+  // ============================================================
+  // 白い羊モブ（10x10 ピクセル × 9スライス、3ポーズ）
+  // +X(右)が正面、Yが左右
+  // ============================================================
+  const SHEEP_PALETTE = {
+    w: "#f6f6f2", // ふわふわ白ウール
+    c: "#ffffff", // 明るい純白ハイライト
+    W: "#dce2eb", // ウール側面・影
+    h: "#4a443e", // 蹄（濃い茶灰）
+    f: "#e4cbb0", // 顔・脚のクリーム色
+    F: "#c9ab8c", // 耳・顔の陰影
+    n: "#e4a29b", // ピンクの鼻先
+    e: "#1a1c22", // 黒い目
+  };
+
+  function makeSheepSliceDefs(stepPose) {
+    const hoofRows =
+      stepPose === 0
+        ? [
+            "..........",
+            "..........",
+            "..h...h...",
+            "..h...h...",
+            "..........",
+            "..........",
+            "..h...h...",
+            "..h...h...",
+            "..........",
+            "..........",
+          ]
+        : stepPose === 1
+        ? [
+            "..........",
+            "..........",
+            ".h.....h..",
+            ".h.....h..",
+            "..........",
+            "..........",
+            "...h.h....",
+            "...h.h....",
+            "..........",
+            "..........",
+          ]
+        : [
+            "..........",
+            "..........",
+            "...h.h....",
+            "...h.h....",
+            "..........",
+            "..........",
+            ".h.....h..",
+            ".h.....h..",
+            "..........",
+            "..........",
+          ];
+
+    const legRows = hoofRows.map((r) => r.replace(/h/g, "f"));
+
+    const bellyRows = [
+      "..........",
+      "..........",
+      ".WWwwwwW..",
+      ".WwwwwwW..",
+      ".WwwwwwW..",
+      ".WwwwwwW..",
+      ".WwwwwwW..",
+      ".WWwwwwW..",
+      "..........",
+      "..........",
+    ];
+
+    const jawRows = [
+      "..........",
+      "..WWWWWW..",
+      ".WwwwwwwW.",
+      ".Wwwwwwwff",
+      "WWwwwwwwfn",
+      "WWwwwwwwfn",
+      ".Wwwwwwwff",
+      ".WwwwwwwW.",
+      "..WWWWWW..",
+      "..........",
+    ];
+
+    const faceRows = [
+      "..........",
+      "..WWWWWW..",
+      ".WwwwwwwF.",
+      ".Wwwwwwwfe",
+      ".Wwwwwwwff",
+      ".Wwwwwwwff",
+      ".Wwwwwwwfe",
+      ".WwwwwwwF.",
+      "..WWWWWW..",
+      "..........",
+    ];
+
+    const upperBodyRows = [
+      "..........",
+      "..WwwwwW..",
+      ".WwwwwwwW.",
+      ".WwwwwwwwW",
+      ".WwwwwwwwW",
+      ".WwwwwwwwW",
+      ".WwwwwwwwW",
+      ".WwwwwwwW.",
+      "..WwwwwW..",
+      "..........",
+    ];
+
+    const backWoolRows = [
+      "..........",
+      "..WwwwwW..",
+      ".WwwccwwW.",
+      ".WwccccwwW",
+      ".WwccccwwW",
+      ".WwccccwwW",
+      ".WwccccwwW",
+      ".WwwccwwW.",
+      "..WwwwwW..",
+      "..........",
+    ];
+
+    const topWoolRows = [
+      "..........",
+      "..........",
+      "..Wwwww...",
+      "..wcccc.w.",
+      "..wccccww.",
+      "..wccccww.",
+      "..wcccc.w.",
+      "..Wwwww...",
+      "..........",
+      "..........",
+    ];
+
+    return [
+      hoofRows,
+      legRows,
+      legRows,
+      bellyRows,
+      jawRows,
+      faceRows,
+      upperBodyRows,
+      backWoolRows,
+      topWoolRows,
+    ];
+  }
+
+  function buildSheepPoseData(stepPose) {
+    const sliceDefs = makeSheepSliceDefs(stepPose);
+    const size = 10;
+    const rawSlices = [];
+    for (let z = 0; z < sliceDefs.length; z++) {
+      const raw = new Uint8Array(size * size * 4);
+      const rows = sliceDefs[z];
+      const shade = 0.84 + (z / (sliceDefs.length - 1)) * 0.20;
+      for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+          const hex = SHEEP_PALETTE[rows[y][x]];
+          if (!hex) continue;
+          const num = parseInt(hex.slice(1), 16);
+          const abgr = shadeAndPackABGR((num >> 16) & 255, (num >> 8) & 255, num & 255, shade);
+          const idx = (y * size + x) * 4;
+          raw[idx] = abgr & 255;
+          raw[idx + 1] = (abgr >>> 8) & 255;
+          raw[idx + 2] = (abgr >>> 16) & 255;
+          raw[idx + 3] = 255;
+        }
+      }
+      rawSlices.push(raw);
+    }
+    return rawSlices;
+  }
+
+  const sheepPoses = {
+    size: 10,
+    sliceCount: 9,
+    rawIdle: buildSheepPoseData(0),
+    rawStepA: buildSheepPoseData(1),
+    rawStepB: buildSheepPoseData(-1),
+  };
+
   const previewModels = {
     grass: buildPreviewBlockModel(BLOCK_GRASS, "grass", "草ブロック"),
     stone: buildPreviewBlockModel(BLOCK_STONE, "stone", "岩ブロック"),
@@ -688,5 +871,6 @@
   global.VoxelWalk.shadePacked24ToABGR = shadePacked24ToABGR;
   global.VoxelWalk.buildWaterAnimFrames = buildWaterAnimFrames;
   global.VoxelWalk.PLAYER_POSES = playerPoses;
+  global.VoxelWalk.SHEEP_POSES = sheepPoses;
   global.VoxelWalk.PREVIEW_MODELS = previewModels;
 })(window);

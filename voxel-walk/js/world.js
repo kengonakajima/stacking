@@ -762,18 +762,19 @@
     const sliceCache = Object.create(null);
 
     const roofDistTable = new Uint8Array(cellCount);
+    function recomputeRoofDistColumn(x, y) {
+      let nearestRoofZ = -1;
+      for (let z = WORLD_Z - 1; z >= 0; z--) {
+        const i = index(x, y, z);
+        roofDistTable[i] = nearestRoofZ !== -1 ? nearestRoofZ - z : 0;
+        if (blocks[i] !== BLOCK_AIR) {
+          nearestRoofZ = z;
+        }
+      }
+    }
     for (let y = 0; y < WORLD_Y; y++) {
       for (let x = 0; x < WORLD_X; x++) {
-        let nearestRoofZ = -1;
-        for (let z = WORLD_Z - 1; z >= 0; z--) {
-          const i = index(x, y, z);
-          if (nearestRoofZ !== -1) {
-            roofDistTable[i] = nearestRoofZ - z;
-          }
-          if (blocks[i] !== BLOCK_AIR) {
-            nearestRoofZ = z;
-          }
-        }
+        recomputeRoofDistColumn(x, y);
       }
     }
 
@@ -797,25 +798,203 @@
 
     const bakeStartMs = performance.now();
 
+    function getSideAOInfo(bx, by, bz, nx, ny) {
+      if (getBlock(bx + nx, by + ny, bz) !== BLOCK_AIR) return null;
+      const tx = ny !== 0 ? 1 : 0;
+      const ty = nx !== 0 ? 1 : 0;
+      const ox = bx + nx;
+      const oy = by + ny;
+      const roofDist = skyRoofDistance(ox, oy, bz);
+      return {
+        floorCrease: bz === 0 || getBlock(ox, oy, bz - 1) !== BLOCK_AIR,
+        overhang: getBlock(ox, oy, bz + 1) !== BLOCK_AIR,
+        cornerNeg: getBlock(ox - tx, oy - ty, bz) !== BLOCK_AIR,
+        cornerPos: getBlock(ox + tx, oy + ty, bz) !== BLOCK_AIR,
+        skyFactor: roofDist > 0 ? Math.min(0.78, 0.56 + roofDist * 0.025) : 1.0,
+      };
+    }
+
+    function bakeCellInSlice(buf32, bx, by, sliceZ, enableAO, enableEdge, clearIfEmpty) {
+      const bz = Math.floor(sliceZ / BLOCK_SLICES);
+      const lz = sliceZ % BLOCK_SLICES;
+      const isBoundaryPlane = lz === 0 && bz > 0;
+      const basePx = bx * BLOCK_SIZE;
+      const basePy = by * BLOCK_SIZE;
+
+      let type = bz < WORLD_Z ? blocks[index(bx, by, bz)] : BLOCK_AIR;
+      let drawBz = bz;
+      let drawLz = lz;
+      let isTopCap = false;
+
+      if (type === BLOCK_AIR) {
+        if (isBoundaryPlane) {
+          const belowType = blocks[index(bx, by, bz - 1)];
+          if (belowType !== BLOCK_AIR) {
+            type = belowType;
+            drawBz = bz - 1;
+            drawLz = BLOCK_SLICES - 1;
+            isTopCap = true;
+          }
+        }
+        if (type === BLOCK_AIR) {
+          if (clearIfEmpty) {
+            for (let ly = 0; ly < BLOCK_SIZE; ly++) {
+              const rowOff = (basePy + ly) * canvasW + basePx;
+              for (let lx = 0; lx < BLOCK_SIZE; lx++) {
+                buf32[rowOff + lx] = 0;
+              }
+            }
+          }
+          return;
+        }
+      }
+
+      if (
+        !isTopCap &&
+        bx > 0 && bx < WORLD_X - 1 && by > 0 && by < WORLD_Y - 1 &&
+        blocks[index(bx - 1, by, drawBz)] !== BLOCK_AIR &&
+        blocks[index(bx + 1, by, drawBz)] !== BLOCK_AIR &&
+        blocks[index(bx, by - 1, drawBz)] !== BLOCK_AIR &&
+        blocks[index(bx, by + 1, drawBz)] !== BLOCK_AIR
+      ) {
+        const packed = BURIED_COLORS[type] || BURIED_COLORS[BLOCK_STONE];
+        for (let ly = 0; ly < BLOCK_SIZE; ly++) {
+          const rowOff = (basePy + ly) * canvasW + basePx;
+          for (let lx = 0; lx < BLOCK_SIZE; lx++) {
+            buf32[rowOff + lx] = packed;
+          }
+        }
+        return;
+      }
+
+      const elevLight = enableEdge ? Math.min(1.26, 0.78 + drawBz * 0.052) : 1.0;
+
+      let aoN = false, aoS = false, aoW = false, aoE = false;
+      let aoNW = false, aoNE = false, aoSW = false, aoSE = false;
+      let topSkyFactor = 1.0;
+
+      let dropN = false, dropS = false, dropW = false, dropE = false;
+      let dropNW = false, dropNE = false, dropSW = false, dropSE = false;
+
+      if (enableEdge && isTopCap) {
+        dropN = getBlock(bx, by - 1, drawBz) === BLOCK_AIR;
+        dropS = getBlock(bx, by + 1, drawBz) === BLOCK_AIR;
+        dropW = getBlock(bx - 1, by, drawBz) === BLOCK_AIR;
+        dropE = getBlock(bx + 1, by, drawBz) === BLOCK_AIR;
+        dropNW = !dropN && !dropW && getBlock(bx - 1, by - 1, drawBz) === BLOCK_AIR;
+        dropNE = !dropN && !dropE && getBlock(bx + 1, by - 1, drawBz) === BLOCK_AIR;
+        dropSW = !dropS && !dropW && getBlock(bx - 1, by + 1, drawBz) === BLOCK_AIR;
+        dropSE = !dropS && !dropE && getBlock(bx + 1, by + 1, drawBz) === BLOCK_AIR;
+      }
+
+      let sideN = null, sideS = null, sideW = null, sideE = null;
+
+      if (enableAO) {
+        if (isTopCap) {
+          aoN = getBlock(bx, by - 1, drawBz + 1) !== BLOCK_AIR;
+          aoS = getBlock(bx, by + 1, drawBz + 1) !== BLOCK_AIR;
+          aoW = getBlock(bx - 1, by, drawBz + 1) !== BLOCK_AIR;
+          aoE = getBlock(bx + 1, by, drawBz + 1) !== BLOCK_AIR;
+          aoNW = getBlock(bx - 1, by - 1, drawBz + 1) !== BLOCK_AIR;
+          aoNE = getBlock(bx + 1, by - 1, drawBz + 1) !== BLOCK_AIR;
+          aoSW = getBlock(bx - 1, by + 1, drawBz + 1) !== BLOCK_AIR;
+          aoSE = getBlock(bx + 1, by + 1, drawBz + 1) !== BLOCK_AIR;
+
+          const roofDist = skyRoofDistance(bx, by, drawBz);
+          if (roofDist > 0) {
+            topSkyFactor = Math.min(0.72, 0.50 + roofDist * 0.03);
+          } else {
+            let nearRoof = 0;
+            if (skyRoofDistance(bx - 1, by, drawBz) > 0) nearRoof++;
+            if (skyRoofDistance(bx + 1, by, drawBz) > 0) nearRoof++;
+            if (skyRoofDistance(bx, by - 1, drawBz) > 0) nearRoof++;
+            if (skyRoofDistance(bx, by + 1, drawBz) > 0) nearRoof++;
+            if (nearRoof > 0) topSkyFactor = 1.0 - nearRoof * 0.05;
+          }
+        } else {
+          sideN = getSideAOInfo(bx, by, drawBz, 0, -1);
+          sideS = getSideAOInfo(bx, by, drawBz, 0, 1);
+          sideW = getSideAOInfo(bx, by, drawBz, -1, 0);
+          sideE = getSideAOInfo(bx, by, drawBz, 1, 0);
+        }
+      }
+
+      const variant = (bx * 31 + by * 17 + drawBz * 13) & 255;
+
+      for (let ly = 0; ly < BLOCK_SIZE; ly++) {
+        const rowOff = (basePy + ly) * canvasW + basePx;
+        for (let lx = 0; lx < BLOCK_SIZE; lx++) {
+          const rgb24 = sampleBlockColor24(type, lx, ly, drawLz, variant, isTopCap);
+          let lightMult = elevLight;
+
+          if (enableAO) {
+            let ao = 1.0;
+
+            if (isTopCap) {
+              ao *= topSkyFactor;
+              if (aoN && ly <= 1) ao *= 0.60 + ly * 0.18;
+              if (aoS && ly >= BLOCK_SIZE - 2) ao *= 0.60 + (BLOCK_SIZE - 1 - ly) * 0.18;
+              if (aoW && lx <= 1) ao *= 0.60 + lx * 0.18;
+              if (aoE && lx >= BLOCK_SIZE - 2) ao *= 0.60 + (BLOCK_SIZE - 1 - lx) * 0.18;
+
+              if (aoNW && !aoN && !aoW && lx <= 1 && ly <= 1) ao *= 0.74 + Math.max(lx, ly) * 0.12;
+              if (aoNE && !aoN && !aoE && lx >= BLOCK_SIZE - 2 && ly <= 1) ao *= 0.74 + Math.max(BLOCK_SIZE - 1 - lx, ly) * 0.12;
+              if (aoSW && !aoS && !aoW && lx <= 1 && ly >= BLOCK_SIZE - 2) ao *= 0.74 + Math.max(lx, BLOCK_SIZE - 1 - ly) * 0.12;
+              if (aoSE && !aoS && !aoE && lx >= BLOCK_SIZE - 2 && ly >= BLOCK_SIZE - 2) ao *= 0.74 + Math.max(BLOCK_SIZE - 1 - lx, BLOCK_SIZE - 1 - ly) * 0.12;
+            } else {
+              const calcFaceAO = (info, tCoord) => {
+                let f = info.skyFactor;
+                if (info.floorCrease && drawLz <= 2) f *= 0.56 + drawLz * 0.15;
+                if (info.overhang && drawLz >= BLOCK_SLICES - 3) f *= 0.52 + (BLOCK_SLICES - 1 - drawLz) * 0.15;
+                if (info.cornerNeg && tCoord <= 1) f *= 0.60 + tCoord * 0.18;
+                if (info.cornerPos && tCoord >= BLOCK_SIZE - 2) f *= 0.60 + (BLOCK_SIZE - 1 - tCoord) * 0.18;
+                return f;
+              };
+
+              if (ly <= 1 && sideN) ao = Math.min(ao, calcFaceAO(sideN, lx));
+              if (ly >= BLOCK_SIZE - 2 && sideS) ao = Math.min(ao, calcFaceAO(sideS, lx));
+              if (lx <= 1 && sideW) ao = Math.min(ao, calcFaceAO(sideW, ly));
+              if (lx >= BLOCK_SIZE - 2 && sideE) ao = Math.min(ao, calcFaceAO(sideE, ly));
+            }
+
+            lightMult *= Math.max(0.30, ao);
+          }
+
+          if (enableEdge && isTopCap) {
+            const isOuter =
+              (dropN && ly === 0) ||
+              (dropS && ly === BLOCK_SIZE - 1) ||
+              (dropW && lx === 0) ||
+              (dropE && lx === BLOCK_SIZE - 1) ||
+              (dropNW && lx === 0 && ly === 0) ||
+              (dropNE && lx === BLOCK_SIZE - 1 && ly === 0) ||
+              (dropSW && lx === 0 && ly === BLOCK_SIZE - 1) ||
+              (dropSE && lx === BLOCK_SIZE - 1 && ly === BLOCK_SIZE - 1);
+
+            if (isOuter) {
+              lightMult *= 0.60;
+            } else {
+              const isBevel =
+                (dropN && ly === 1) ||
+                (dropS && ly === BLOCK_SIZE - 2) ||
+                (dropW && lx === 1) ||
+                (dropE && lx === BLOCK_SIZE - 2) ||
+                (dropNW && lx <= 1 && ly <= 1) ||
+                (dropNE && lx >= BLOCK_SIZE - 2 && ly <= 1) ||
+                (dropSW && lx <= 1 && ly >= BLOCK_SIZE - 2) ||
+                (dropSE && lx >= BLOCK_SIZE - 2 && ly >= BLOCK_SIZE - 2);
+              if (isBevel) lightMult *= 1.15;
+            }
+          }
+
+          buf32[rowOff + lx] = shadePacked24ToABGR(rgb24, Math.max(0.26, lightMult));
+        }
+      }
+    }
+
     function bakeSlices(enableAO, enableEdge) {
       const slices = [];
       const bounds = [];
-
-      function getSideAOInfo(bx, by, bz, nx, ny) {
-        if (getBlock(bx + nx, by + ny, bz) !== BLOCK_AIR) return null;
-        const tx = ny !== 0 ? 1 : 0;
-        const ty = nx !== 0 ? 1 : 0;
-        const ox = bx + nx;
-        const oy = by + ny;
-        const roofDist = skyRoofDistance(ox, oy, bz);
-        return {
-          floorCrease: bz === 0 || getBlock(ox, oy, bz - 1) !== BLOCK_AIR,
-          overhang: getBlock(ox, oy, bz + 1) !== BLOCK_AIR,
-          cornerNeg: getBlock(ox - tx, oy - ty, bz) !== BLOCK_AIR,
-          cornerPos: getBlock(ox + tx, oy + ty, bz) !== BLOCK_AIR,
-          skyFactor: roofDist > 0 ? Math.min(0.78, 0.56 + roofDist * 0.025) : 1.0,
-        };
-      }
 
       for (let sliceZ = 0; sliceZ < totalSlices; sliceZ++) {
         const bz = Math.floor(sliceZ / BLOCK_SLICES);
@@ -849,170 +1028,8 @@
         const buf32 = new Uint32Array(rawBytes.buffer);
 
         for (let by = bMinY; by <= bMaxY; by++) {
-          const basePy = by * BLOCK_SIZE;
           for (let bx = bMinX; bx <= bMaxX; bx++) {
-            let type = bz < WORLD_Z ? blocks[index(bx, by, bz)] : BLOCK_AIR;
-            let drawBz = bz;
-            let drawLz = lz;
-            let isTopCap = false;
-
-            if (type === BLOCK_AIR) {
-              if (isBoundaryPlane) {
-                const belowType = blocks[index(bx, by, bz - 1)];
-                if (belowType !== BLOCK_AIR) {
-                  type = belowType;
-                  drawBz = bz - 1;
-                  drawLz = BLOCK_SLICES - 1;
-                  isTopCap = true;
-                }
-              }
-              if (type === BLOCK_AIR) continue;
-            }
-
-            const basePx = bx * BLOCK_SIZE;
-
-            if (
-              !isTopCap &&
-              bx > 0 && bx < WORLD_X - 1 && by > 0 && by < WORLD_Y - 1 &&
-              blocks[index(bx - 1, by, drawBz)] !== BLOCK_AIR &&
-              blocks[index(bx + 1, by, drawBz)] !== BLOCK_AIR &&
-              blocks[index(bx, by - 1, drawBz)] !== BLOCK_AIR &&
-              blocks[index(bx, by + 1, drawBz)] !== BLOCK_AIR
-            ) {
-              const packed = BURIED_COLORS[type] || BURIED_COLORS[BLOCK_STONE];
-              for (let ly = 0; ly < BLOCK_SIZE; ly++) {
-                const rowOff = (basePy + ly) * canvasW + basePx;
-                for (let lx = 0; lx < BLOCK_SIZE; lx++) {
-                  buf32[rowOff + lx] = packed;
-                }
-              }
-              continue;
-            }
-
-            const elevLight = enableEdge ? Math.min(1.26, 0.78 + drawBz * 0.052) : 1.0;
-
-            let aoN = false, aoS = false, aoW = false, aoE = false;
-            let aoNW = false, aoNE = false, aoSW = false, aoSE = false;
-            let topSkyFactor = 1.0;
-
-            let dropN = false, dropS = false, dropW = false, dropE = false;
-            let dropNW = false, dropNE = false, dropSW = false, dropSE = false;
-
-            if (enableEdge && isTopCap) {
-              dropN = getBlock(bx, by - 1, drawBz) === BLOCK_AIR;
-              dropS = getBlock(bx, by + 1, drawBz) === BLOCK_AIR;
-              dropW = getBlock(bx - 1, by, drawBz) === BLOCK_AIR;
-              dropE = getBlock(bx + 1, by, drawBz) === BLOCK_AIR;
-              dropNW = !dropN && !dropW && getBlock(bx - 1, by - 1, drawBz) === BLOCK_AIR;
-              dropNE = !dropN && !dropE && getBlock(bx + 1, by - 1, drawBz) === BLOCK_AIR;
-              dropSW = !dropS && !dropW && getBlock(bx - 1, by + 1, drawBz) === BLOCK_AIR;
-              dropSE = !dropS && !dropE && getBlock(bx + 1, by + 1, drawBz) === BLOCK_AIR;
-            }
-
-            let sideN = null, sideS = null, sideW = null, sideE = null;
-
-            if (enableAO) {
-              if (isTopCap) {
-                aoN = getBlock(bx, by - 1, drawBz + 1) !== BLOCK_AIR;
-                aoS = getBlock(bx, by + 1, drawBz + 1) !== BLOCK_AIR;
-                aoW = getBlock(bx - 1, by, drawBz + 1) !== BLOCK_AIR;
-                aoE = getBlock(bx + 1, by, drawBz + 1) !== BLOCK_AIR;
-                aoNW = getBlock(bx - 1, by - 1, drawBz + 1) !== BLOCK_AIR;
-                aoNE = getBlock(bx + 1, by - 1, drawBz + 1) !== BLOCK_AIR;
-                aoSW = getBlock(bx - 1, by + 1, drawBz + 1) !== BLOCK_AIR;
-                aoSE = getBlock(bx + 1, by + 1, drawBz + 1) !== BLOCK_AIR;
-
-                const roofDist = skyRoofDistance(bx, by, drawBz);
-                if (roofDist > 0) {
-                  // 洞窟内でも床と段差がしっかり視認できる適度な地下陰影 (0.50〜0.72)
-                  topSkyFactor = Math.min(0.72, 0.50 + roofDist * 0.03);
-                } else {
-                  let nearRoof = 0;
-                  if (skyRoofDistance(bx - 1, by, drawBz) > 0) nearRoof++;
-                  if (skyRoofDistance(bx + 1, by, drawBz) > 0) nearRoof++;
-                  if (skyRoofDistance(bx, by - 1, drawBz) > 0) nearRoof++;
-                  if (skyRoofDistance(bx, by + 1, drawBz) > 0) nearRoof++;
-                  if (nearRoof > 0) topSkyFactor = 1.0 - nearRoof * 0.05;
-                }
-              } else {
-                sideN = getSideAOInfo(bx, by, drawBz, 0, -1);
-                sideS = getSideAOInfo(bx, by, drawBz, 0, 1);
-                sideW = getSideAOInfo(bx, by, drawBz, -1, 0);
-                sideE = getSideAOInfo(bx, by, drawBz, 1, 0);
-              }
-            }
-
-            const variant = (bx * 31 + by * 17 + drawBz * 13) & 255;
-
-            for (let ly = 0; ly < BLOCK_SIZE; ly++) {
-              const rowOff = (basePy + ly) * canvasW + basePx;
-              for (let lx = 0; lx < BLOCK_SIZE; lx++) {
-                const rgb24 = sampleBlockColor24(type, lx, ly, drawLz, variant, isTopCap);
-                let lightMult = elevLight;
-
-                if (enableAO) {
-                  let ao = 1.0;
-
-                  if (isTopCap) {
-                    ao *= topSkyFactor;
-                    if (aoN && ly <= 1) ao *= 0.60 + ly * 0.18;
-                    if (aoS && ly >= BLOCK_SIZE - 2) ao *= 0.60 + (BLOCK_SIZE - 1 - ly) * 0.18;
-                    if (aoW && lx <= 1) ao *= 0.60 + lx * 0.18;
-                    if (aoE && lx >= BLOCK_SIZE - 2) ao *= 0.60 + (BLOCK_SIZE - 1 - lx) * 0.18;
-
-                    if (aoNW && !aoN && !aoW && lx <= 1 && ly <= 1) ao *= 0.74 + Math.max(lx, ly) * 0.12;
-                    if (aoNE && !aoN && !aoE && lx >= BLOCK_SIZE - 2 && ly <= 1) ao *= 0.74 + Math.max(BLOCK_SIZE - 1 - lx, ly) * 0.12;
-                    if (aoSW && !aoS && !aoW && lx <= 1 && ly >= BLOCK_SIZE - 2) ao *= 0.74 + Math.max(lx, BLOCK_SIZE - 1 - ly) * 0.12;
-                    if (aoSE && !aoS && !aoE && lx >= BLOCK_SIZE - 2 && ly >= BLOCK_SIZE - 2) ao *= 0.74 + Math.max(BLOCK_SIZE - 1 - lx, BLOCK_SIZE - 1 - ly) * 0.12;
-                  } else {
-                    const calcFaceAO = (info, tCoord) => {
-                      let f = info.skyFactor;
-                      if (info.floorCrease && drawLz <= 2) f *= 0.56 + drawLz * 0.15;
-                      if (info.overhang && drawLz >= BLOCK_SLICES - 3) f *= 0.52 + (BLOCK_SLICES - 1 - drawLz) * 0.15;
-                      if (info.cornerNeg && tCoord <= 1) f *= 0.60 + tCoord * 0.18;
-                      if (info.cornerPos && tCoord >= BLOCK_SIZE - 2) f *= 0.60 + (BLOCK_SIZE - 1 - tCoord) * 0.18;
-                      return f;
-                    };
-
-                    if (ly <= 1 && sideN) ao = Math.min(ao, calcFaceAO(sideN, lx));
-                    if (ly >= BLOCK_SIZE - 2 && sideS) ao = Math.min(ao, calcFaceAO(sideS, lx));
-                    if (lx <= 1 && sideW) ao = Math.min(ao, calcFaceAO(sideW, ly));
-                    if (lx >= BLOCK_SIZE - 2 && sideE) ao = Math.min(ao, calcFaceAO(sideE, ly));
-                  }
-
-                  lightMult *= Math.max(0.30, ao);
-                }
-
-                if (enableEdge && isTopCap) {
-                  const isOuter =
-                    (dropN && ly === 0) ||
-                    (dropS && ly === BLOCK_SIZE - 1) ||
-                    (dropW && lx === 0) ||
-                    (dropE && lx === BLOCK_SIZE - 1) ||
-                    (dropNW && lx === 0 && ly === 0) ||
-                    (dropNE && lx === BLOCK_SIZE - 1 && ly === 0) ||
-                    (dropSW && lx === 0 && ly === BLOCK_SIZE - 1) ||
-                    (dropSE && lx === BLOCK_SIZE - 1 && ly === BLOCK_SIZE - 1);
-
-                  if (isOuter) {
-                    lightMult *= 0.60;
-                  } else {
-                    const isBevel =
-                      (dropN && ly === 1) ||
-                      (dropS && ly === BLOCK_SIZE - 2) ||
-                      (dropW && lx === 1) ||
-                      (dropE && lx === BLOCK_SIZE - 2) ||
-                      (dropNW && lx <= 1 && ly <= 1) ||
-                      (dropNE && lx >= BLOCK_SIZE - 2 && ly <= 1) ||
-                      (dropSW && lx <= 1 && ly >= BLOCK_SIZE - 2) ||
-                      (dropSE && lx >= BLOCK_SIZE - 2 && ly >= BLOCK_SIZE - 2);
-                    if (isBevel) lightMult *= 1.15;
-                  }
-                }
-
-                buf32[rowOff + lx] = shadePacked24ToABGR(rgb24, Math.max(0.26, lightMult));
-              }
-            }
+            bakeCellInSlice(buf32, bx, by, sliceZ, enableAO, enableEdge, false);
           }
         }
 
@@ -1020,6 +1037,87 @@
       }
 
       return { slices, bounds };
+    }
+
+    const dirtyTerrainSlices = new Uint8Array(totalSlices);
+    let terrainTexVersion = 0;
+
+    // 任意の1ブロックを即座に破壊（デブリなし・局所差分ベイク＋水流再起動＋3Dライト即時再計算）
+    function destroyBlockAt(bx, by, bz) {
+      if (!inBounds(bx, by, bz)) return false;
+      const idx = index(bx, by, bz);
+      if (blocks[idx] === BLOCK_AIR) return false;
+
+      blocks[idx] = BLOCK_AIR;
+      foliage[idx] = 0;
+      if (bz + 1 < WORLD_Z) {
+        foliage[index(bx, by, bz + 1)] = 0;
+      }
+      if (torches[idx]) {
+        torches[idx] = 0;
+        torchCount = Math.max(0, torchCount - 1);
+      }
+
+      // 地表高さと空天井距離テーブルをこの列だけ更新
+      let topSolid = 0;
+      for (let z = WORLD_Z - 1; z >= 0; z--) {
+        if (blocks[index(bx, by, z)] !== BLOCK_AIR) {
+          topSolid = z;
+          break;
+        }
+      }
+      surfaceHeight[by * WORLD_X + bx] = topSolid;
+      recomputeRoofDistColumn(bx, by);
+
+      // 影響する 3×3 ブロックと直下カラムだけ超高速に局所再ベイク
+      const minBx = Math.max(0, bx - 1);
+      const maxBx = Math.min(WORLD_X - 1, bx + 1);
+      const minBy = Math.max(0, by - 1);
+      const maxBy = Math.min(WORLD_Y - 1, by + 1);
+      const maxLocalSl = Math.min(maxUsedSlice - 1, (bz + 2) * BLOCK_SLICES);
+
+      for (const key in sliceCache) {
+        const pack = sliceCache[key];
+        const parts = key.split("_");
+        const eAO = parts[0] === "1";
+        const eEdge = parts[1] === "1";
+
+        for (let s = 0; s <= maxLocalSl; s++) {
+          let rawBytes = pack.slices[s];
+          if (!rawBytes) {
+            if (s < Math.max(0, (bz - 1) * BLOCK_SLICES)) continue;
+            rawBytes = new Uint8Array(canvasW * canvasH * 4);
+            pack.slices[s] = rawBytes;
+          }
+          const buf32 = new Uint32Array(rawBytes.buffer);
+          for (let cy = minBy; cy <= maxBy; cy++) {
+            for (let cx = minBx; cx <= maxBx; cx++) {
+              bakeCellInSlice(buf32, cx, cy, s, eAO, eEdge, true);
+            }
+          }
+          dirtyTerrainSlices[s] = 1;
+        }
+      }
+      terrainTexVersion++;
+
+      // 水流テクスチャ・落下距離マップを更新し、周囲の水をすぐ新しい穴へ流し込む
+      markBlockWaterDirty(bz);
+      if (bz > 0) markBlockWaterDirty(bz - 1);
+      if (bz + 1 < WORLD_Z) markBlockWaterDirty(bz + 1);
+      layerHasWater[bz] = 1;
+      if (bz > 0) layerHasWater[bz - 1] = 1;
+      if (bz + 1 < WORLD_Z) layerHasWater[bz + 1] = 1;
+      waterSettled = false;
+      calmStreak = 0;
+      recomputeActiveDrops();
+      rebuildDirtyWaterSlices();
+
+      // 太陽光（洞窟の天窓）と松明・溶岩の光を即時再計算
+      recomputeSkyLight();
+      recomputeBlockLight();
+      packLightTexture();
+
+      return true;
     }
 
     function getSlicePack(enableAO, enableEdge) {
@@ -1918,6 +2016,209 @@
     recomputeBlockLight();
     packLightTexture();
 
+    // ============================================================
+    // 8.5 白い羊モブのスポーン＆のんびり放牧AI
+    // ============================================================
+    const sheepList = [];
+    function spawnSheep(sx, sy, sz, idx) {
+      sheepList.push({
+        x: sx + 0.5,
+        y: sy + 0.5,
+        z: sz,
+        vz: 0,
+        radius: 0.30,
+        height: 1.12,
+        facing: hash3(sx, sy, seed + 6100 + idx) * Math.PI * 2,
+        targetFacing: hash3(sx, sy, seed + 6100 + idx) * Math.PI * 2,
+        state: idx % 2 === 0 ? "walk" : "idle",
+        timer: 1.2 + hash3(sx, sy, seed + 6200 + idx) * 3.0,
+        isMoving: false,
+        onGround: true,
+        inWater: false,
+        walkCycle: hash3(sx, sy, seed + 6300 + idx) * 10.0,
+      });
+    }
+
+    function canSpawnSheepAt(x, y) {
+      if (x < 6 || y < 6 || x >= WORLD_X - 6 || y >= WORLD_Y - 6) return false;
+      const topZ = surfaceHeight[y * WORLD_X + x];
+      const z = topZ + 1;
+      if (z + 1 >= WORLD_Z) return false;
+      if (getBlock(x, y, topZ) !== BLOCK_GRASS) return false;
+      if (getBlock(x, y, z) !== BLOCK_AIR || getBlock(x, y, z + 1) !== BLOCK_AIR) return false;
+      if (water[index(x, y, z)] > 0) return false;
+      for (let i = 0; i < sheepList.length; i++) {
+        if (Math.hypot(x + 0.5 - sheepList[i].x, y + 0.5 - sheepList[i].y) < 3.5) return false;
+      }
+      return true;
+    }
+
+    // スタート地点のすぐ近く（4〜14ブロック圏）に3匹スポーンしてすぐ見つけられるように
+    for (let attempt = 0; attempt < 260 && sheepList.length < 3; attempt++) {
+      const ang = hash3(attempt, 1, seed + 6400) * Math.PI * 2;
+      const dist = 4.5 + hash3(attempt, 2, seed + 6400) * 10.0;
+      const sx = Math.round(spawnX + Math.cos(ang) * dist);
+      const sy = Math.round(spawnY + Math.sin(ang) * dist);
+      if (canSpawnSheepAt(sx, sy)) {
+        spawnSheep(sx, sy, surfaceHeight[sy * WORLD_X + sx] + 1, sheepList.length);
+      }
+    }
+    // さらに草原バイオーム全体に合計10匹まで配置
+    for (let attempt = 0; attempt < 600 && sheepList.length < 10; attempt++) {
+      const sx = 10 + Math.floor(hash3(attempt, 3, seed + 6500) * (WORLD_X - 20));
+      const sy = 10 + Math.floor(hash3(attempt, 4, seed + 6500) * (WORLD_Y - 20));
+      if (canSpawnSheepAt(sx, sy)) {
+        spawnSheep(sx, sy, surfaceHeight[sy * WORLD_X + sx] + 1, sheepList.length);
+      }
+    }
+
+    function sheepHasSolidAtLayer(px, py, r, bz) {
+      const minX = Math.floor(px - r);
+      const maxX = Math.floor(px + r);
+      const minY = Math.floor(py - r);
+      const maxY = Math.floor(py + r);
+      for (let by = minY; by <= maxY; by++) {
+        for (let bx = minX; bx <= maxX; bx++) {
+          if (getBlock(bx, by, bz) !== BLOCK_AIR) return true;
+        }
+      }
+      return false;
+    }
+
+    function sheepCollidesAt(px, py, pz, r, h) {
+      if (px - r < 1 || px + r > WORLD_X - 1 || py - r < 1 || py + r > WORLD_Y - 1) return true;
+      const minZ = Math.floor(pz + 0.01);
+      const maxZ = Math.floor(pz + h - 0.01);
+      for (let bz = minZ; bz <= maxZ; bz++) {
+        if (sheepHasSolidAtLayer(px, py, r, bz)) return true;
+      }
+      return false;
+    }
+
+    function updateSheep(dt, player) {
+      const stepDt = Math.min(0.05, Math.max(0.001, dt));
+      for (let i = 0; i < sheepList.length; i++) {
+        const s = sheepList[i];
+        const wLv = getWaterLevelAt(s.x, s.y, s.z + 0.1);
+        s.inWater = wLv > 0;
+
+        if (player) {
+          const pdx = s.x - player.x;
+          const pdy = s.y - player.y;
+          const pDist = Math.hypot(pdx, pdy);
+          if (pDist < 1.1 && pDist > 0.05 && Math.abs(s.z - player.z) < 1.5) {
+            s.targetFacing = Math.atan2(pdy, pdx);
+            s.state = "walk";
+            s.timer = Math.max(s.timer, 1.6);
+          }
+        }
+
+        s.timer -= stepDt;
+        if (s.timer <= 0) {
+          if (s.state === "walk") {
+            s.state = "idle";
+            s.timer = 2.0 + Math.random() * 3.5;
+          } else {
+            s.state = "walk";
+            s.targetFacing = s.facing + (Math.random() - 0.5) * Math.PI * 1.4;
+            s.timer = 2.2 + Math.random() * 3.2;
+          }
+        }
+
+        let diff = s.targetFacing - s.facing;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        s.facing += diff * Math.min(1, stepDt * 5.0);
+
+        s.isMoving = s.state === "walk";
+        if (s.isMoving) {
+          const speed = s.inWater ? 0.95 : 1.35;
+          const vx = Math.cos(s.facing) * speed * stepDt;
+          const vy = Math.sin(s.facing) * speed * stepDt;
+          const nx = s.x + vx;
+          const ny = s.y + vy;
+
+          const aheadX = Math.floor(s.x + Math.cos(s.facing) * 0.85);
+          const aheadY = Math.floor(s.y + Math.sin(s.facing) * 0.85);
+          const aheadFloor = findFloorBelow(aheadX + 0.5, aheadY + 0.5, s.z + 0.5);
+          const dangerous = aheadFloor.blockType === BLOCK_LAVA || s.z - aheadFloor.floorZ > 2.2;
+
+          if (dangerous) {
+            s.targetFacing = s.facing + Math.PI * (0.7 + Math.random() * 0.6);
+          } else {
+            let blocked = false;
+            if (!sheepCollidesAt(nx, s.y, s.z, s.radius, s.height)) {
+              s.x = nx;
+            } else {
+              blocked = true;
+            }
+            if (!sheepCollidesAt(s.x, ny, s.z, s.radius, s.height)) {
+              s.y = ny;
+            } else {
+              blocked = true;
+            }
+
+            if (blocked) {
+              if (s.onGround && !sheepCollidesAt(nx, ny, s.z + 1.05, s.radius, s.height)) {
+                s.vz = 7.4;
+                s.onGround = false;
+              } else {
+                s.targetFacing = s.facing + Math.PI * (0.6 + Math.random() * 0.8);
+              }
+            }
+          }
+          s.walkCycle += stepDt;
+        }
+
+        if (s.inWater && s.vz < 1.6) {
+          s.vz += 18.0 * stepDt;
+        }
+        const grav = s.inWater ? 9.0 : 20.0;
+        s.vz -= grav * stepDt;
+        if (s.inWater && s.vz < -2.2) s.vz = -2.2;
+
+        const nextZ = s.z + s.vz * stepDt;
+        if (s.vz <= 0) {
+          if (nextZ <= 0) {
+            s.z = 0;
+            s.vz = 0;
+            s.onGround = true;
+          } else {
+            const startBz = Math.floor(s.z - 0.0001);
+            const endBz = Math.floor(nextZ);
+            let landed = false;
+            for (let bz = startBz; bz >= endBz; bz--) {
+              if (sheepHasSolidAtLayer(s.x, s.y, s.radius, bz)) {
+                s.z = bz + 1;
+                s.vz = 0;
+                s.onGround = true;
+                landed = true;
+                break;
+              }
+            }
+            if (!landed) {
+              s.z = nextZ;
+              s.onGround = false;
+            }
+          }
+        } else {
+          const startCeil = Math.floor(s.z + s.height);
+          const endCeil = Math.floor(nextZ + s.height);
+          let hitCeil = false;
+          for (let bz = startCeil; bz <= endCeil; bz++) {
+            if (sheepHasSolidAtLayer(s.x, s.y, s.radius, bz)) {
+              s.z = bz - s.height - 0.001;
+              s.vz = 0;
+              hitCeil = true;
+              break;
+            }
+          }
+          if (!hitCeil) s.z = nextZ;
+          s.onGround = false;
+        }
+      }
+    }
+
     return {
       seed,
       sizeX: WORLD_X,
@@ -1952,6 +2253,11 @@
       getBiomeNameAt,
       getSlices,
       getSlicePack,
+      dirtyTerrainSlices,
+      getTerrainTexVersion: () => terrainTexVersion,
+      destroyBlockAt,
+      sheep: sheepList,
+      updateSheep,
       waterLayerBytes,
       dirtyWaterLayers,
       getWaterTexVersion: () => waterTexVersion,
