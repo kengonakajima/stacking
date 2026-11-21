@@ -53,8 +53,10 @@
   /**
    * ブロック内のローカル座標 (lx, ly, lz) の基本色 [r, g, b] を返す。
    * variantSeed はワールド内の座標ハッシュ（隣り合うブロックに自然な揺らぎを出す）。
+   * isTopFace が true のときはブロック上面（天面キャップ）として明るく描画する。
    */
-  function sampleBlockColor(blockType, lx, ly, lz, variantSeed) {
+  function sampleBlockColor(blockType, lx, ly, lz, variantSeed, isTopFace) {
+    const topFace = isTopFace !== undefined ? isTopFace : lz === BLOCK_SLICES - 1;
     const n = hash3(lx + variantSeed * 13, ly + variantSeed * 7, lz + variantSeed * 5);
     const isEdge = lx === 0 || lx === BLOCK_SIZE - 1 || ly === 0 || ly === BLOCK_SIZE - 1;
     const isNearEdge = lx <= 1 || lx >= BLOCK_SIZE - 2 || ly <= 1 || ly >= BLOCK_SIZE - 2;
@@ -62,7 +64,7 @@
     // 面の向きによる明暗差（上面を明るく、垂直の側面をしっかり暗くする）
     // 仰角を低くしても内部の明るい色が漏れないよう外周2px＋内部も側面トーンにする
     let faceLight = 1.0;
-    if (lz === BLOCK_SLICES - 1) {
+    if (topFace) {
       faceLight = 1.06; // 上面がいちばん明るい
     } else {
       let sideLight = 0.62;
@@ -82,7 +84,7 @@
         sideLight = dirLight;
       }
       // ブロック下端ほど暗く、上端ほど明るい垂直グラデーション
-      const heightGrad = 0.80 + (lz / (BLOCK_SLICES - 2)) * 0.24;
+      const heightGrad = 0.80 + (Math.min(lz, BLOCK_SLICES - 1) / (BLOCK_SLICES - 1)) * 0.24;
       faceLight = sideLight * heightGrad;
     }
 
@@ -103,8 +105,8 @@
 
     // ===== 草ブロック =====
     if (blockType === BLOCK_GRASS) {
-      // 最上層 (lz = 9) とその直下 (lz = 8) は全面が緑の芝
-      if (lz >= BLOCK_SLICES - 2) {
+      // 上面キャップ、および側面の上部2層 (lz = 8, 9) は緑の芝
+      if (topFace || lz >= BLOCK_SLICES - 2) {
         let base;
         if (n > 0.78) base = [116, 198, 76];
         else if (n > 0.40) base = [92, 176, 62];

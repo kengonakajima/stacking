@@ -127,7 +127,8 @@
     }
 
     // ワールドの水平断面スライス配列（AO / 段差エッジ強調の組み合わせごとに遅延キャッシュ）
-    const totalSlices = WORLD_Z * BLOCK_SLICES;
+    // ※ 最上段ブロックの天面キャップを sliceZ = WORLD_Z * BLOCK_SLICES に描くため +1 枚確保
+    const totalSlices = WORLD_Z * BLOCK_SLICES + 1;
     const canvasW = WORLD_X * BLOCK_SIZE;
     const canvasH = WORLD_Y * BLOCK_SIZE;
     const sliceCache = Object.create(null);
@@ -165,9 +166,10 @@
       for (let sliceZ = 0; sliceZ < totalSlices; sliceZ++) {
         const bz = Math.floor(sliceZ / BLOCK_SLICES);
         const lz = sliceZ % BLOCK_SLICES;
-        const isTopSlice = lz === BLOCK_SLICES - 1;
-        // 標高が高い段ほど明るくして、重なり合う平らな面同士を高さで見分けやすくする
-        const elevLight = enableEdge ? 0.80 + bz * 0.095 : 1.0;
+        // ブロック境界 (lz === 0, すなわち sliceZ = bz * 10) では、
+        // 「bz の底面」と「bz - 1 の露出天面キャップ」を同じ1枚のスライスに同居させる！
+        // これにより立体交差（橋の底面と隣の段の上面）の境目に1スライス分の隙間が絶対に生じない。
+        const isBoundaryPlane = lz === 0 && bz > 0;
 
         const c = document.createElement("canvas");
         c.width = canvasW;
@@ -180,82 +182,100 @@
 
         for (let by = 0; by < WORLD_Y; by++) {
           for (let bx = 0; bx < WORLD_X; bx++) {
-            const type = getBlock(bx, by, bz);
-            if (type === BLOCK_AIR) continue;
+            let type = bz < WORLD_Z ? getBlock(bx, by, bz) : BLOCK_AIR;
+            let drawBz = bz;
+            let drawLz = lz;
+            let isTopCap = false;
+
+            if (type === BLOCK_AIR) {
+              // ブロック境界スライスで、直下 (bz - 1) に露出ブロックがあればその天面キャップを描く
+              if (isBoundaryPlane) {
+                const belowType = getBlock(bx, by, bz - 1);
+                if (belowType !== BLOCK_AIR) {
+                  type = belowType;
+                  drawBz = bz - 1;
+                  drawLz = BLOCK_SLICES - 1;
+                  isTopCap = true;
+                }
+              }
+              if (type === BLOCK_AIR) continue;
+            }
             hasAnyPixel = true;
+
+            // 標高が高い段ほど明るくして、重なり合う平らな面同士を高さで見分けやすくする
+            const elevLight = enableEdge ? 0.80 + drawBz * 0.095 : 1.0;
 
             // --- 上面 AO / 上空遮蔽の事前判定 ---
             let aoN = false, aoS = false, aoW = false, aoE = false;
             let aoNW = false, aoNE = false, aoSW = false, aoSE = false;
             let topSkyFactor = 1.0;
 
-            // --- 上面の露出段差エッジ（同じ高さ bz の隣が空＝崖のフチ）判定 ---
+            // --- 上面の露出段差エッジ（同じ高さ drawBz の隣が空＝崖のフチ）判定 ---
             let dropN = false, dropS = false, dropW = false, dropE = false;
             let dropNW = false, dropNE = false, dropSW = false, dropSE = false;
-            const hasAirAbove = isTopSlice && getBlock(bx, by, bz + 1) === BLOCK_AIR;
 
-            if (enableEdge && hasAirAbove) {
-              dropN = getBlock(bx, by - 1, bz) === BLOCK_AIR;
-              dropS = getBlock(bx, by + 1, bz) === BLOCK_AIR;
-              dropW = getBlock(bx - 1, by, bz) === BLOCK_AIR;
-              dropE = getBlock(bx + 1, by, bz) === BLOCK_AIR;
+            if (enableEdge && isTopCap) {
+              dropN = getBlock(bx, by - 1, drawBz) === BLOCK_AIR;
+              dropS = getBlock(bx, by + 1, drawBz) === BLOCK_AIR;
+              dropW = getBlock(bx - 1, by, drawBz) === BLOCK_AIR;
+              dropE = getBlock(bx + 1, by, drawBz) === BLOCK_AIR;
               // L字台地の内角でも輪郭線が途切れないよう対角の落ち込みも判定
-              dropNW = !dropN && !dropW && getBlock(bx - 1, by - 1, bz) === BLOCK_AIR;
-              dropNE = !dropN && !dropE && getBlock(bx + 1, by - 1, bz) === BLOCK_AIR;
-              dropSW = !dropS && !dropW && getBlock(bx - 1, by + 1, bz) === BLOCK_AIR;
-              dropSE = !dropS && !dropE && getBlock(bx + 1, by + 1, bz) === BLOCK_AIR;
+              dropNW = !dropN && !dropW && getBlock(bx - 1, by - 1, drawBz) === BLOCK_AIR;
+              dropNE = !dropN && !dropE && getBlock(bx + 1, by - 1, drawBz) === BLOCK_AIR;
+              dropSW = !dropS && !dropW && getBlock(bx - 1, by + 1, drawBz) === BLOCK_AIR;
+              dropSE = !dropS && !dropE && getBlock(bx + 1, by + 1, drawBz) === BLOCK_AIR;
             }
 
             // --- 垂直面（東西南北）の 3D AO 事前判定 ---
             let sideN = null, sideS = null, sideW = null, sideE = null;
 
             if (enableAO) {
-              if (isTopSlice) {
-                aoN = getBlock(bx, by - 1, bz + 1) !== BLOCK_AIR;
-                aoS = getBlock(bx, by + 1, bz + 1) !== BLOCK_AIR;
-                aoW = getBlock(bx - 1, by, bz + 1) !== BLOCK_AIR;
-                aoE = getBlock(bx + 1, by, bz + 1) !== BLOCK_AIR;
-                aoNW = getBlock(bx - 1, by - 1, bz + 1) !== BLOCK_AIR;
-                aoNE = getBlock(bx + 1, by - 1, bz + 1) !== BLOCK_AIR;
-                aoSW = getBlock(bx - 1, by + 1, bz + 1) !== BLOCK_AIR;
-                aoSE = getBlock(bx + 1, by + 1, bz + 1) !== BLOCK_AIR;
+              if (isTopCap) {
+                aoN = getBlock(bx, by - 1, drawBz + 1) !== BLOCK_AIR;
+                aoS = getBlock(bx, by + 1, drawBz + 1) !== BLOCK_AIR;
+                aoW = getBlock(bx - 1, by, drawBz + 1) !== BLOCK_AIR;
+                aoE = getBlock(bx + 1, by, drawBz + 1) !== BLOCK_AIR;
+                aoNW = getBlock(bx - 1, by - 1, drawBz + 1) !== BLOCK_AIR;
+                aoNE = getBlock(bx + 1, by - 1, drawBz + 1) !== BLOCK_AIR;
+                aoSW = getBlock(bx - 1, by + 1, drawBz + 1) !== BLOCK_AIR;
+                aoSE = getBlock(bx + 1, by + 1, drawBz + 1) !== BLOCK_AIR;
 
                 // 真上に屋根（橋など）があれば強い影、隣接に屋根があれば柔らかい入口影
-                const roofDist = skyRoofDistance(bx, by, bz);
+                const roofDist = skyRoofDistance(bx, by, drawBz);
                 if (roofDist > 0) {
                   topSkyFactor = Math.min(0.64, 0.50 + roofDist * 0.035);
                 } else {
                   let nearRoof = 0;
-                  if (skyRoofDistance(bx - 1, by, bz) > 0) nearRoof++;
-                  if (skyRoofDistance(bx + 1, by, bz) > 0) nearRoof++;
-                  if (skyRoofDistance(bx, by - 1, bz) > 0) nearRoof++;
-                  if (skyRoofDistance(bx, by + 1, bz) > 0) nearRoof++;
+                  if (skyRoofDistance(bx - 1, by, drawBz) > 0) nearRoof++;
+                  if (skyRoofDistance(bx + 1, by, drawBz) > 0) nearRoof++;
+                  if (skyRoofDistance(bx, by - 1, drawBz) > 0) nearRoof++;
+                  if (skyRoofDistance(bx, by + 1, drawBz) > 0) nearRoof++;
                   if (nearRoof > 0) {
                     topSkyFactor = 1.0 - nearRoof * 0.055;
                   }
                 }
               } else {
-                sideN = getSideAOInfo(bx, by, bz, 0, -1);
-                sideS = getSideAOInfo(bx, by, bz, 0, 1);
-                sideW = getSideAOInfo(bx, by, bz, -1, 0);
-                sideE = getSideAOInfo(bx, by, bz, 1, 0);
+                sideN = getSideAOInfo(bx, by, drawBz, 0, -1);
+                sideS = getSideAOInfo(bx, by, drawBz, 0, 1);
+                sideW = getSideAOInfo(bx, by, drawBz, -1, 0);
+                sideE = getSideAOInfo(bx, by, drawBz, 1, 0);
               }
             }
 
-            const variant = (bx * 31 + by * 17 + bz * 13) & 255;
+            const variant = (bx * 31 + by * 17 + drawBz * 13) & 255;
 
             for (let ly = 0; ly < BLOCK_SIZE; ly++) {
               const py = by * BLOCK_SIZE + ly;
               for (let lx = 0; lx < BLOCK_SIZE; lx++) {
                 const px = bx * BLOCK_SIZE + lx;
-                let [r, g, b] = sampleBlockColor(type, lx, ly, lz, variant);
+                let [r, g, b] = sampleBlockColor(type, lx, ly, drawLz, variant, isTopCap);
 
                 let lightMult = elevLight;
 
                 if (enableAO) {
                   let ao = 1.0;
 
-                  if (isTopSlice) {
+                  if (isTopCap) {
                     // 上面：上空遮蔽＋4辺の段差接地影＋4隅の対角コーナーAO
                     ao *= topSkyFactor;
 
@@ -282,13 +302,13 @@
                     // 凸角で2面分が二重乗算されないよう、各面のAOの最小値を採用する
                     const calcFaceAO = (info, tCoord) => {
                       let f = info.skyFactor;
-                      // ① 下辺：床と接する根元 (lz = 0..3) を暗く
-                      if (info.floorCrease && lz <= 3) {
-                        f *= 0.54 + lz * 0.12;
+                      // ① 下辺：床と接する根元 (drawLz = 0..3) を暗く
+                      if (info.floorCrease && drawLz <= 3) {
+                        f *= 0.54 + drawLz * 0.12;
                       }
-                      // ② 上辺：張り出し・橋の下 (lz = 5..8) を暗く
-                      if (info.overhang && lz >= 5) {
-                        f *= 0.52 + (8 - lz) * 0.12;
+                      // ② 上辺：張り出し・橋の下 (drawLz = 6..9) を暗く
+                      if (info.overhang && drawLz >= 6) {
+                        f *= 0.52 + (9 - drawLz) * 0.12;
                       }
                       // ③ 縦エッジ：L字の凹角 (左右端3px) を暗く
                       if (info.cornerNeg && tCoord <= 2) {
@@ -311,7 +331,7 @@
 
                 // 段差エッジ強調：突き出たブロックの上面の外周（崖のフチ）に
                 // 「1px 暗い輪郭線 ＋ 内側1px 明るいベベル」を入れて背景の平面からくっきり分離させる
-                if (enableEdge && hasAirAbove) {
+                if (enableEdge && isTopCap) {
                   const isOuterContour =
                     (dropN && ly === 0) ||
                     (dropS && ly === BLOCK_SIZE - 1) ||
