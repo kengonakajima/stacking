@@ -74,9 +74,10 @@
     uniform int uMode;                  // 0=地形+水+松明, 1=地形のみ, 2=水+松明のみ
     uniform int uWireframe;
 
-    // 昼夜ライティング
-    uniform float uSunBrightness;       // 昼 1.0 -> 夜 0.035
+    // 昼夜ライティング＋雲の影
+    uniform float uSunBrightness;       // 昼 1.0 -> 夜 0.032
     uniform vec3 uSkyLightColor;        // 昼:白, 夕:オレンジ, 夜:深い紺
+    uniform int uCloudsEnabled;         // 1=雲と雲の影ON
 
     // 洞窟・遮蔽時の X-Ray 透視カットアウト
     uniform vec2 uPlayerScreenPos;
@@ -151,7 +152,61 @@
       return ivec2(int(floor(rg.r * 255.0 + 0.5)), int(floor(rg.g * 255.0 + 0.5)));
     }
 
-    // 3D ライトマップから滑らかな総合照明カラー（太陽光＋16ブロック到達の光源光）を計算
+    // 雲シェーダーと共有する積雲フィールド（東+Xから西-Xへ流れるもこもこ雲の塊）
+    float cloudHash(vec2 p) {
+      p = fract(p * vec2(123.34, 456.21));
+      p += dot(p, p + 45.32);
+      return fract(p.x * p.y);
+    }
+
+    vec2 cloudHash2(vec2 p) {
+      vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+      p3 += dot(p3, p3.yzx + 33.33);
+      return fract((p3.xx + p3.yz) * p3.zy);
+    }
+
+    float cloudNoise(vec2 p) {
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      vec2 u = f * f * (3.0 - 2.0 * f);
+      return mix(
+        mix(cloudHash(i), cloudHash(i + vec2(1.0, 0.0)), u.x),
+        mix(cloudHash(i + vec2(0.0, 1.0)), cloudHash(i + vec2(1.0, 1.0)), u.x),
+        u.y
+      );
+    }
+
+    // 丸い泡が重なり合う「もこもこ」積雲ドームの高さ (0..1)
+    float cloudPuffDomes(vec2 p) {
+      vec2 gp = p * 0.135;
+      vec2 ip = floor(gp);
+      vec2 fp = fract(gp);
+      float best = 0.0;
+      for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+          vec2 cell = ip + vec2(float(i), float(j));
+          vec2 h = cloudHash2(cell + vec2(4.7, 9.1));
+          vec2 center = vec2(float(i), float(j)) + 0.18 + h * 0.64;
+          float r = 0.62 + h.x * 0.36;
+          float d = length(fp - center) / r;
+          float dome = clamp(1.0 - d * d, 0.0, 1.0);
+          best = max(best, dome);
+        }
+      }
+      return sqrt(best);
+    }
+
+    // 雲の高さ・密度マップ (0=快晴, >0.52=雲本体、高いほどもこもこ盛り上がる)
+    float cloudField(vec2 p) {
+      float base =
+        cloudNoise(p * vec2(0.038, 0.050) + vec2(3.1, 7.4)) * 0.72 +
+        cloudNoise(p * vec2(0.082, 0.096) + vec2(11.7, 2.9)) * 0.28;
+      if (base < 0.36) return 0.0;
+      float puffs = cloudPuffDomes(p);
+      return base * 0.68 + puffs * 0.42;
+    }
+
+    // 3D ライトマップから滑らかな総合照明カラー（太陽光＋雲の影＋16ブロック到達の光源光）を計算
     vec3 evalWorldLight(vec2 blockPos, int sliceZ) {
       vec3 luv = vec3(
         blockPos.x / uWorldSize.x,
@@ -168,6 +223,14 @@
       float flicker = 0.965 + 0.035 * sin(uTime * 6.8 + blockPos.x * 1.3 + blockPos.y * 1.7);
       vec3 blockCol = vec3(1.12, 0.78, 0.42) * bL * flicker;
       vec3 skyCol = uSkyLightColor * sL;
+
+      // 高さ20を東→西へ流れるもこもこ雲が落とす柔らかな青み影（太陽光のみに作用し、洞窟や松明光は遮らない）
+      if (uCloudsEnabled == 1 && sL > 0.01) {
+        float dh = max(0.0, 20.0 - float(sliceZ) * 0.125);
+        vec2 sp = blockPos + vec2(uTime * 0.85, 0.0) + vec2(-0.08, -0.06) * dh;
+        float cShadow = smoothstep(0.79, 0.87, cloudField(sp));
+        skyCol *= mix(vec3(1.0), vec3(0.42, 0.50, 0.66), cShadow);
+      }
 
       // 夜・深洞窟はほぼ真っ暗（わずかな月明かりベース 0.014 のみ）
       vec3 baseDark = vec3(0.012, 0.016, 0.026);
@@ -693,6 +756,293 @@
     }
   `;
 
+  // 高さ20の3Dボクセル雲シェーダー（1ドローコール・6スライスインスタンシング・画面全体カバー）
+  const CLOUD_VS = `#version 300 es
+    precision highp float;
+
+    layout(location = 0) in vec2 aQuadPos;
+
+    uniform vec2 uViewport;
+    uniform vec2 uCenter;
+    uniform vec2 uCamXY;
+    uniform float uCamBaseSlice;
+    uniform vec2 uYawCS;
+    uniform float uSquashY;
+    uniform float uLiftPerSlice;
+    uniform float uBlockPx;
+    uniform float uCloudBaseSlice;
+    uniform float uCloudSliceStep;
+
+    out vec2 vWorldXY;
+    flat out int vLayer;
+
+    void main() {
+      vLayer = gl_InstanceID;
+      float cloudSliceZ = uCloudBaseSlice + float(gl_InstanceID) * uCloudSliceStep;
+
+      vec2 ndc = aQuadPos * 2.0 - 1.0;
+      gl_Position = vec4(ndc, 0.0, 1.0);
+
+      // 画面座標から高さ cloudSliceZ の水平ワールド座標へ厳密に逆投影（WORLD_VS と完全一致）
+      vec2 screenPx = vec2(aQuadPos.x * uViewport.x, (1.0 - aQuadPos.y) * uViewport.y);
+      float rx = screenPx.x - uCenter.x;
+      float ryUnsq = (screenPx.y - uCenter.y + (cloudSliceZ - uCamBaseSlice) * uLiftPerSlice) / max(0.15, uSquashY);
+      vec2 rel = vec2(rx * uYawCS.x + ryUnsq * uYawCS.y, -rx * uYawCS.y + ryUnsq * uYawCS.x) / uBlockPx;
+      vWorldXY = uCamXY + rel;
+    }
+  `;
+
+  const CLOUD_FS = `#version 300 es
+    precision highp float;
+
+    uniform vec2 uViewport;
+    uniform float uTime;
+    uniform float uSunBrightness;
+    uniform vec3 uSkyLightColor;
+    uniform vec2 uPlayerScreenPos;
+    uniform float uBlockPx;
+
+    in vec2 vWorldXY;
+    flat in int vLayer;
+
+    out vec4 outColor;
+
+    float cloudHash(vec2 p) {
+      p = fract(p * vec2(123.34, 456.21));
+      p += dot(p, p + 45.32);
+      return fract(p.x * p.y);
+    }
+
+    vec2 cloudHash2(vec2 p) {
+      vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+      p3 += dot(p3, p3.yzx + 33.33);
+      return fract((p3.xx + p3.yz) * p3.zy);
+    }
+
+    float cloudNoise(vec2 p) {
+      vec2 i = floor(p);
+      vec2 f = fract(p);
+      vec2 u = f * f * (3.0 - 2.0 * f);
+      return mix(
+        mix(cloudHash(i), cloudHash(i + vec2(1.0, 0.0)), u.x),
+        mix(cloudHash(i + vec2(0.0, 1.0)), cloudHash(i + vec2(1.0, 1.0)), u.x),
+        u.y
+      );
+    }
+
+    float cloudPuffDomes(vec2 p) {
+      vec2 gp = p * 0.135;
+      vec2 ip = floor(gp);
+      vec2 fp = fract(gp);
+      float best = 0.0;
+      for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+          vec2 cell = ip + vec2(float(i), float(j));
+          vec2 h = cloudHash2(cell + vec2(4.7, 9.1));
+          vec2 center = vec2(float(i), float(j)) + 0.18 + h * 0.64;
+          float r = 0.62 + h.x * 0.36;
+          float d = length(fp - center) / r;
+          float dome = clamp(1.0 - d * d, 0.0, 1.0);
+          best = max(best, dome);
+        }
+      }
+      return sqrt(best);
+    }
+
+    float cloudField(vec2 p) {
+      float base =
+        cloudNoise(p * vec2(0.038, 0.050) + vec2(3.1, 7.4)) * 0.72 +
+        cloudNoise(p * vec2(0.082, 0.096) + vec2(11.7, 2.9)) * 0.28;
+      if (base < 0.36) return 0.0;
+      float puffs = cloudPuffDomes(p);
+      return base * 0.68 + puffs * 0.42;
+    }
+
+    // 1×1×1 雲ブロックの積み上げ段数 (0=空 ~80%, 1=縁 ~10%, 2=雲本体 ~6%, 3=もこもこ頂上 ~4%)
+    int cloudHeightBlocks(vec2 q) {
+      float d = cloudField(q + 0.5);
+      if (d < 0.810) return 0;
+      if (d < 0.865) return 1;
+      if (d < 0.915) return 2;
+      return 3;
+    }
+
+    void main() {
+      // 東(+X)から西(-X)へゆっくり流れる、大きさ 1×1×1 の「雲ブロック」が集まった立体雲！
+      vec2 p = vWorldXY + vec2(uTime * 0.85, 0.0);
+      vec2 q = floor(p);
+      int h = cloudHeightBlocks(q);
+      if (h == 0) discard;
+
+      int cz = vLayer / 8;
+      int lz = vLayer - cz * 8;
+      bool isBlockPlane = (lz == 0);
+
+      int drawCz = -1;
+      int drawLz = lz;
+      bool isTopCap = false;
+
+      if (cz < h) {
+        drawCz = cz;
+      } else if (isBlockPlane && cz > 0 && cz == h) {
+        // 地形と同じ共有境界スライス方式の露出天面キャップ（隙間ゼロの完全1×1×1立方体！）
+        drawCz = cz - 1;
+        drawLz = 7;
+        isTopCap = true;
+      } else {
+        discard;
+      }
+
+      // 地形ブロックと同じ 6×6 ピクセル解像度のボクセル質感
+      vec2 cellUv = fract(p);
+      vec2 pix = floor(cellUv * 6.0);
+      float pixNoise = cloudHash(q * 7.0 + pix + vec2(float(drawCz) * 13.0, float(drawLz) * 5.0));
+
+      int hW = cloudHeightBlocks(q + vec2(-1.0, 0.0));
+      int hE = cloudHeightBlocks(q + vec2( 1.0, 0.0));
+      int hN = cloudHeightBlocks(q + vec2( 0.0,-1.0));
+      int hS = cloudHeightBlocks(q + vec2( 0.0, 1.0));
+
+      float shade = 1.0;
+
+      if (isTopCap) {
+        // 雲ブロックの上面：明るく真っ白＋段差の縁にベベル＋上に重なる雲ブロックの根元に3D AO影！
+        shade = 1.03 + float(drawCz) * 0.035;
+        bool stepW = hW > drawCz + 1;
+        bool stepE = hE > drawCz + 1;
+        bool stepN = hN > drawCz + 1;
+        bool stepS = hS > drawCz + 1;
+        if ((stepW && pix.x <= 0.5) || (stepE && pix.x >= 4.5) || (stepN && pix.y <= 0.5) || (stepS && pix.y >= 4.5)) {
+          shade *= 0.80; // 1段高い雲ブロックとの境目に立体的なAO影
+        } else if ((stepW && pix.x <= 1.5) || (stepE && pix.x >= 3.5) || (stepN && pix.y <= 1.5) || (stepS && pix.y >= 3.5)) {
+          shade *= 0.91;
+        }
+
+        // 外周ドロップ縁の輪郭エッジ（1ブロックごとの角がクッキリ分かる！）
+        bool dropW = hW <= drawCz;
+        bool dropE = hE <= drawCz;
+        bool dropN = hN <= drawCz;
+        bool dropS = hS <= drawCz;
+        if ((dropW && pix.x <= 0.5) || (dropS && pix.y >= 4.5)) {
+          shade *= 0.88;
+        } else if ((dropE && pix.x >= 4.5) || (dropN && pix.y <= 0.5)) {
+          shade *= 1.05;
+        }
+      } else {
+        // 雲ブロックの側面（blocks.js の地形ブロックと同じ方向別ライティング＋段差陰影）
+        float sideLight = 0.78;
+        float dW = pix.x;
+        float dE = 5.0 - pix.x;
+        float dN = pix.y;
+        float dS = 5.0 - pix.y;
+        float minD = min(min(dW, dE), min(dN, dS));
+        if (minD <= 1.5) {
+          sideLight = 1.0;
+          if (dW == minD) sideLight = min(sideLight, 0.66);
+          if (dN == minD) sideLight = min(sideLight, 0.75);
+          if (dS == minD) sideLight = min(sideLight, 0.84);
+          if (dE == minD) sideLight = min(sideLight, 0.94);
+        }
+        float vGrad = 0.84 + (float(drawLz) / 7.0) * 0.16;
+        // 最下段の雲底をわずかにクールに締める
+        float baseAO = (drawCz == 0 && drawLz <= 1) ? 0.90 : 1.0;
+        shade = sideLight * vGrad * baseAO * (0.94 + float(drawCz) * 0.04);
+      }
+
+      // 6×6 ドットごとのわずかな雲テクスチャムラ（のっぺりさせずボクセル感を強調）
+      shade *= (0.965 + pixNoise * 0.065);
+
+      // 昼(真っ白＋涼やかな青灰側面) / 夕方(茜・黄金) / 夜(月明かりの濃い紺)
+      float dayAmt = clamp(uSunBrightness * 1.15, 0.0, 1.0);
+      vec3 litCol = mix(vec3(0.11, 0.15, 0.25), min(vec3(1.06), uSkyLightColor * vec3(1.02, 1.02, 1.04)), dayAmt);
+      vec3 shadowCol = mix(vec3(0.04, 0.06, 0.12), uSkyLightColor * vec3(0.56, 0.68, 0.86), dayAmt);
+      vec3 col = mix(shadowCol, litCol, clamp((shade - 0.56) / 0.52, 0.0, 1.0));
+
+      // プレイヤー周辺の広い範囲を完全に透かして視界を確保（25枚重なっても白く潰れないよう単層フェード）
+      float minView = min(uViewport.x, uViewport.y);
+      float rInner = min(uBlockPx * 5.5, minView * 0.29);
+      float rOuter = min(uBlockPx * 9.5, minView * 0.46);
+      float pDist = length(gl_FragCoord.xy - uPlayerScreenPos);
+      if (pDist < rInner) discard;
+
+      float alpha = 0.92;
+      if (pDist < rOuter) {
+        // 遷移ゾーンでは上面キャップ(1層)だけを滑らかにフェードし、多重スライスによる不透明化を防ぐ
+        if (!isTopCap) discard;
+        float t = smoothstep(rInner, rOuter, pDist);
+        alpha = t * 0.65;
+      }
+      outColor = vec4(col, alpha);
+    }
+  `;
+
+  // JS 側でもプレイヤーの受光色へ同じもこもこ雲の影を同期させる軽量ヘルパー
+  function fractJS(x) {
+    return x - Math.floor(x);
+  }
+  function cloudHashJS(px, py) {
+    let x = fractJS(px * 123.34);
+    let y = fractJS(py * 456.21);
+    const dot = x * (y + 45.32) + y * (x + 45.32);
+    x += dot;
+    y += dot;
+    return fractJS(x * y);
+  }
+  function cloudHash2JS(px, py) {
+    let x = fractJS(px * 0.1031);
+    let y = fractJS(py * 0.1030);
+    let z = fractJS(px * 0.0973);
+    const dot = x * (y + 33.33) + y * (z + 33.33) + z * (x + 33.33);
+    x += dot;
+    y += dot;
+    z += dot;
+    return [fractJS((x + y) * z), fractJS((x + z) * y)];
+  }
+  function cloudNoiseJS(px, py) {
+    const ix = Math.floor(px);
+    const iy = Math.floor(py);
+    const fx = px - ix;
+    const fy = py - iy;
+    const ux = fx * fx * (3 - 2 * fx);
+    const uy = fy * fy * (3 - 2 * fy);
+    const a = cloudHashJS(ix, iy);
+    const b = cloudHashJS(ix + 1, iy);
+    const c = cloudHashJS(ix, iy + 1);
+    const d = cloudHashJS(ix + 1, iy + 1);
+    return a + (b - a) * ux + (c + (d - c) * ux - (a + (b - a) * ux)) * uy;
+  }
+  function evalCloudShadowJS(wx, wy, wz, timeSec) {
+    const dh = Math.max(0, 20.0 - wz);
+    const px = wx + timeSec * 0.85 - 0.08 * dh;
+    const py = wy - 0.06 * dh;
+    const base =
+      cloudNoiseJS(px * 0.038 + 3.1, py * 0.050 + 7.4) * 0.72 +
+      cloudNoiseJS(px * 0.082 + 11.7, py * 0.096 + 2.9) * 0.28;
+    if (base < 0.36) return 0;
+    const gpx = px * 0.135;
+    const gpy = py * 0.135;
+    const ipx = Math.floor(gpx);
+    const ipy = Math.floor(gpy);
+    const fpx = gpx - ipx;
+    const fpy = gpy - ipy;
+    let best = 0;
+    for (let j = -1; j <= 1; j++) {
+      for (let i = -1; i <= 1; i++) {
+        const h = cloudHash2JS(ipx + i + 4.7, ipy + j + 9.1);
+        const cx = i + 0.18 + h[0] * 0.64;
+        const cy = j + 0.18 + h[1] * 0.64;
+        const r = 0.62 + h[0] * 0.36;
+        const dx = (fpx - cx) / r;
+        const dy = (fpy - cy) / r;
+        const dome = Math.max(0, 1 - (dx * dx + dy * dy));
+        if (dome > best) best = dome;
+      }
+    }
+    const cd = base * 0.68 + Math.sqrt(best) * 0.42;
+    const t = Math.max(0, Math.min(1, (cd - 0.79) / (0.87 - 0.79)));
+    return t * t * (3 - 2 * t);
+  }
+
   function compileShader(gl, type, src) {
     const sh = gl.createShader(type);
     gl.shaderSource(sh, src);
@@ -734,6 +1084,7 @@
 
     const worldProg = createProgram(gl, WORLD_VS, WORLD_FS);
     const spriteProg = createProgram(gl, SPRITE_VS, SPRITE_FS);
+    const cloudProg = createProgram(gl, CLOUD_VS, CLOUD_FS);
 
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
@@ -771,6 +1122,7 @@
       uWireframe: gl.getUniformLocation(worldProg, "uWireframe"),
       uSunBrightness: gl.getUniformLocation(worldProg, "uSunBrightness"),
       uSkyLightColor: gl.getUniformLocation(worldProg, "uSkyLightColor"),
+      uCloudsEnabled: gl.getUniformLocation(worldProg, "uCloudsEnabled"),
       uPlayerScreenPos: gl.getUniformLocation(worldProg, "uPlayerScreenPos"),
       uPlayerWorldPos: gl.getUniformLocation(worldProg, "uPlayerWorldPos"),
       uPlayerBaseSlice: gl.getUniformLocation(worldProg, "uPlayerBaseSlice"),
@@ -798,6 +1150,23 @@
       uShadowAlpha: gl.getUniformLocation(spriteProg, "uShadowAlpha"),
       uShowBox: gl.getUniformLocation(spriteProg, "uShowBox"),
       uPlayerTint: gl.getUniformLocation(spriteProg, "uPlayerTint"),
+    };
+
+    const cLoc = {
+      uViewport: gl.getUniformLocation(cloudProg, "uViewport"),
+      uCenter: gl.getUniformLocation(cloudProg, "uCenter"),
+      uCamXY: gl.getUniformLocation(cloudProg, "uCamXY"),
+      uCamBaseSlice: gl.getUniformLocation(cloudProg, "uCamBaseSlice"),
+      uYawCS: gl.getUniformLocation(cloudProg, "uYawCS"),
+      uSquashY: gl.getUniformLocation(cloudProg, "uSquashY"),
+      uLiftPerSlice: gl.getUniformLocation(cloudProg, "uLiftPerSlice"),
+      uBlockPx: gl.getUniformLocation(cloudProg, "uBlockPx"),
+      uCloudBaseSlice: gl.getUniformLocation(cloudProg, "uCloudBaseSlice"),
+      uCloudSliceStep: gl.getUniformLocation(cloudProg, "uCloudSliceStep"),
+      uTime: gl.getUniformLocation(cloudProg, "uTime"),
+      uSunBrightness: gl.getUniformLocation(cloudProg, "uSunBrightness"),
+      uSkyLightColor: gl.getUniformLocation(cloudProg, "uSkyLightColor"),
+      uPlayerScreenPos: gl.getUniformLocation(cloudProg, "uPlayerScreenPos"),
     };
 
     const pSliceCount = PLAYER_POSES.rawIdle.length;
@@ -1051,14 +1420,19 @@
 
       const sunBrightness = settings.sunBrightness !== undefined ? settings.sunBrightness : 1.0;
       const skyLightColor = settings.skyLightColor || [1.0, 0.99, 0.96];
+      const cloudsEnabled = settings.showClouds !== false;
 
-      // プレイヤー自身の受光色（真っ暗な夜でもキャラの位置がうっすら分かる最小値 0.14 を確保）
+      // プレイヤー自身の受光色（雲の影にも連動、真っ暗な夜でも最小値 0.14 を確保）
       const pLight = world.getLightAt(player.x, player.y, player.z + 0.8);
       const pbL = Math.pow(pLight.block / 15, 1.55);
       const psL = Math.pow(pLight.sky / 15, 1.35) * sunBrightness;
-      const pTintR = Math.min(1.2, Math.max(0.14, skyLightColor[0] * psL + 1.12 * pbL * (1 - psL * 0.4)));
-      const pTintG = Math.min(1.2, Math.max(0.15, skyLightColor[1] * psL + 0.78 * pbL * (1 - psL * 0.4)));
-      const pTintB = Math.min(1.2, Math.max(0.20, skyLightColor[2] * psL + 0.44 * pbL * (1 - psL * 0.4)));
+      const pCloudSh = cloudsEnabled && psL > 0.01 ? evalCloudShadowJS(player.x, player.y, player.z + 0.8, timeSec) : 0;
+      const pSkyR = skyLightColor[0] * psL * (1 - pCloudSh * 0.58);
+      const pSkyG = skyLightColor[1] * psL * (1 - pCloudSh * 0.50);
+      const pSkyB = skyLightColor[2] * psL * (1 - pCloudSh * 0.34);
+      const pTintR = Math.min(1.2, Math.max(0.14, pSkyR + 1.12 * pbL * (1 - psL * 0.4)));
+      const pTintG = Math.min(1.2, Math.max(0.15, pSkyG + 0.78 * pbL * (1 - psL * 0.4)));
+      const pTintB = Math.min(1.2, Math.max(0.20, pSkyB + 0.44 * pbL * (1 - psL * 0.4)));
 
       const floorInfo = world.findFloorBelow(player.x, player.y, player.z + 0.05);
       const shadowSliceZ = Math.round(floorInfo.floorZ * BLOCK_SLICES);
@@ -1155,6 +1529,7 @@
         gl.uniform1i(wLoc.uWireframe, settings.showWireframe ? 1 : 0);
         gl.uniform1f(wLoc.uSunBrightness, sunBrightness);
         gl.uniform3f(wLoc.uSkyLightColor, skyLightColor[0], skyLightColor[1], skyLightColor[2]);
+        gl.uniform1i(wLoc.uCloudsEnabled, cloudsEnabled ? 1 : 0);
         gl.uniform2f(wLoc.uPlayerScreenPos, pScreenX, pFragY);
         gl.uniform3f(wLoc.uPlayerWorldPos, player.x, player.y, player.z);
         gl.uniform1i(wLoc.uPlayerBaseSlice, playerBaseSlice);
@@ -1242,6 +1617,28 @@
 
       if (pEnd < limitZ) {
         drawWorldBatch(pEnd, limitZ - pEnd, 0);
+      }
+
+      // 高さ 19..22 (最大3段 = 24+1=25スライス) の 1×1×1 雲ブロック集合体（1ドローコール）
+      if (cloudsEnabled && settings.maxVisibleSlice >= world.maxUsedSlice) {
+        currentProg = cloudProg;
+        gl.useProgram(cloudProg);
+        gl.uniform2f(cLoc.uViewport, viewW, viewH);
+        gl.uniform2f(cLoc.uCenter, centerX, centerY);
+        gl.uniform2f(cLoc.uCamXY, cam.x, cam.y);
+        gl.uniform1f(cLoc.uCamBaseSlice, camBaseSlice);
+        gl.uniform2f(cLoc.uYawCS, cosYaw, sinYaw);
+        gl.uniform1f(cLoc.uSquashY, squashY);
+        gl.uniform1f(cLoc.uLiftPerSlice, liftPerSlice);
+        gl.uniform1f(cLoc.uBlockPx, blockScreenPx);
+        gl.uniform1f(cLoc.uCloudBaseSlice, 19.0 * BLOCK_SLICES);
+        gl.uniform1f(cLoc.uCloudSliceStep, 1.0);
+        gl.uniform1f(cLoc.uTime, timeSec);
+        gl.uniform1f(cLoc.uSunBrightness, sunBrightness);
+        gl.uniform3f(cLoc.uSkyLightColor, skyLightColor[0], skyLightColor[1], skyLightColor[2]);
+        gl.uniform2f(cLoc.uPlayerScreenPos, pScreenX, pFragY);
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, 25);
+        miscDrawCalls++;
       }
 
       gl.bindVertexArray(null);

@@ -20,7 +20,7 @@
             </div>
             <div class="stat">
               <span class="stat-label">時刻</span>
-              <span id="hud-time" class="stat-value">15:30 (昼)</span>
+              <span id="hud-time" class="stat-value">05:30 (朝)</span>
             </div>
             <div class="stat">
               <span class="stat-label">POS</span>
@@ -128,9 +128,9 @@
         <div class="control-block">
           <div class="control-label-row">
             <label for="slider-time">昼夜サイクル（時刻）</label>
-            <span id="val-time" class="mono-val">15:30 (昼)</span>
+            <span id="val-time" class="mono-val">05:30 (朝)</span>
           </div>
-          <input id="slider-time" type="range" min="0" max="24" step="0.1" value="15.5" />
+          <input id="slider-time" type="range" min="0" max="24" step="0.1" value="5.5" />
           <div class="preset-row">
             <button class="chip-btn" data-time="5.9">朝</button>
             <button class="chip-btn" data-time="12.0">昼</button>
@@ -160,6 +160,7 @@
             <span id="val-water-total" class="mono-val">57600 / 57600 (流動中)</span>
           </div>
           <div class="preset-row">
+            <button id="btn-goto-spring" class="chip-btn chip-accent">⛲ 山の泉へ移動</button>
             <button id="btn-goto-cave" class="chip-btn chip-accent">🕳 洞窟の入口へ移動</button>
             <button id="btn-reflow-water" class="chip-btn">💧 水を流し直す</button>
             <button id="btn-regen-world" class="chip-btn">🏔 新しい地形</button>
@@ -245,6 +246,10 @@
           <label class="toggle-item">
             <input id="chk-wireframe" type="checkbox" />
             <span>スライス枠を表示</span>
+          </label>
+          <label class="toggle-item">
+            <input id="chk-clouds" type="checkbox" checked />
+            <span>雲と雲の影 (高さ20)</span>
           </label>
         </div>
       </section>

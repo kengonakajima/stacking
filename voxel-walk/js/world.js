@@ -317,6 +317,139 @@
     }
 
     // ============================================================
+    // 2.2. 山の上の「湧き水の泉」（ずっと少しずつ水が湧き出して滝・川へ流れる）
+    // ============================================================
+    const springs = [];
+
+    // ① ランドマーク岩山（大オーバーハング山頂 x=74..76, y=54..55）に天然の石の泉を彫刻
+    // z=9 を岩で囲まれた1段深い「泉の池（常に満水）」にし、z=10 から少しずつ湧き出して滝口(75,53->52->51)へ溢れ落とす！
+    for (let x = 73; x <= 77; x++) {
+      for (let y = 53; y <= 56; y++) {
+        const inBasin = x >= 74 && x <= 76 && y >= 54 && y <= 55;
+        const inSpillway = x === 75 && y === 53;
+        if (inBasin) {
+          setBlock(x, y, 8, BLOCK_DARK_STONE); // 泉の底（オーバーハング天井 z=8 を維持）
+          setBlock(x, y, 9, BLOCK_AIR);        // 常に満水になる泉の池レイヤー
+          setBlock(x, y, 10, BLOCK_AIR);       // 湧き水があふれる水面レイヤー
+          for (let cz = 11; cz < WORLD_Z; cz++) setBlock(x, y, cz, BLOCK_AIR);
+        } else if (inSpillway) {
+          setBlock(x, y, 8, BLOCK_DARK_STONE);
+          setBlock(x, y, 9, BLOCK_DARK_STONE); // 堰（せき）：z=9 の池の水を溜めつつ z=10 の溢れ水を流す！
+          setBlock(x, y, 10, BLOCK_AIR);
+          for (let cz = 11; cz < WORLD_Z; cz++) setBlock(x, y, cz, BLOCK_AIR);
+        } else {
+          // 泉の岩縁（東・西・南の石垣＋西側 x=73 の見晴らし岩棚）
+          setBlock(x, y, 8, BLOCK_DARK_STONE);
+          setBlock(x, y, 9, BLOCK_STONE);
+          setBlock(x, y, 10, BLOCK_STONE);
+          if ((y === 56 && x >= 74 && x <= 76) || (x === 77 && y >= 54 && y <= 55)) {
+            setBlock(x, y, 11, BLOCK_DARK_STONE);
+            for (let cz = 12; cz < WORLD_Z; cz++) setBlock(x, y, cz, BLOCK_AIR);
+          } else {
+            for (let cz = 11; cz < WORLD_Z; cz++) setBlock(x, y, cz, BLOCK_AIR);
+          }
+        }
+      }
+    }
+    // 滝口 (75, 52, 9) の先を空けて、オーバーハングから谷底へ滝が落ちるようにする
+    setBlock(75, 52, 8, BLOCK_DARK_STONE);
+    setBlock(75, 52, 9, BLOCK_STONE);
+    for (let cz = 10; cz < WORLD_Z; cz++) setBlock(75, 52, cz, BLOCK_AIR);
+    springs.push({ x: 75, y: 55, z: 10, basinZ: 9, rate: 5, interval: 2 });
+
+    // ② さらにマップ各地の高い山・高台に 4〜5か所の山の泉（くぼんだ池＋湧出）を自動配置
+    const peakCandidates = [];
+    for (let y = 16; y < WORLD_Y - 16; y += 3) {
+      for (let x = 16; x < WORLD_X - 16; x += 3) {
+        if (Math.hypot(x - 75, y - 55) < 20) continue;
+        if (Math.hypot(x - 60, y - 64) < 12) continue;
+        let topZ = 0;
+        for (let z = WORLD_Z - 2; z >= 7; z--) {
+          if (getBlock(x, y, z) !== BLOCK_AIR) {
+            topZ = z;
+            break;
+          }
+        }
+        if (topZ >= 9 && topZ <= 12) {
+          peakCandidates.push({
+            x,
+            y,
+            z: topZ,
+            score: topZ * 2.0 + biomeMap[y * WORLD_X + x] * 1.5 + hash3(x, y, seed + 8811) * 1.8,
+          });
+        }
+      }
+    }
+    peakCandidates.sort((a, b) => b.score - a.score);
+
+    const extraSpringTarget = 5;
+    let extraPlaced = 0;
+    for (let k = 0; k < peakCandidates.length && extraPlaced < extraSpringTarget; k++) {
+      const cand = peakCandidates[k];
+      let tooClose = false;
+      for (let s = 0; s < springs.length; s++) {
+        if (Math.hypot(cand.x - springs[s].x, cand.y - springs[s].y) < 20) {
+          tooClose = true;
+          break;
+        }
+      }
+      if (tooClose) continue;
+
+      const sx = cand.x;
+      const sy = cand.y;
+      const sz = cand.z;
+      // 4方向のうち最も地形が低い側へ堰（せき）の切れ目を向ける
+      const spillDirs = [
+        [0, -1],
+        [0, 1],
+        [-1, 0],
+        [1, 0],
+      ];
+      let bestDir = spillDirs[0];
+      let lowestNeighbor = 99;
+      for (let d = 0; d < 4; d++) {
+        const nx = sx + spillDirs[d][0] * 2;
+        const ny = sy + spillDirs[d][1] * 2;
+        if (!inBounds(nx, ny, 0)) continue;
+        let nz = 0;
+        for (let z = WORLD_Z - 1; z >= 0; z--) {
+          if (getBlock(nx, ny, z) !== BLOCK_AIR) {
+            nz = z;
+            break;
+          }
+        }
+        if (nz < lowestNeighbor) {
+          lowestNeighbor = nz;
+          bestDir = spillDirs[d];
+        }
+      }
+
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const bx = sx + dx;
+          const by = sy + dy;
+          if (!inBounds(bx, by, sz)) continue;
+          if (dx === 0 && dy === 0) {
+            setBlock(bx, by, sz - 2, BLOCK_DARK_STONE);
+            setBlock(bx, by, sz - 1, BLOCK_AIR); // くぼんだ泉の池（常に満水）
+            setBlock(bx, by, sz, BLOCK_AIR);     // 湧出＆溢れ層
+            for (let cz = sz + 1; cz < WORLD_Z; cz++) setBlock(bx, by, cz, BLOCK_AIR);
+          } else if (dx === bestDir[0] && dy === bestDir[1]) {
+            setBlock(bx, by, sz - 1, BLOCK_DARK_STONE); // 低い谷側へ向けた堰
+            setBlock(bx, by, sz, BLOCK_AIR);
+            for (let cz = sz + 1; cz < WORLD_Z; cz++) setBlock(bx, by, cz, BLOCK_AIR);
+          } else {
+            setBlock(bx, by, sz - 1, BLOCK_STONE);
+            setBlock(bx, by, sz, BLOCK_STONE);
+            for (let cz = sz + 1; cz < WORLD_Z; cz++) setBlock(bx, by, cz, BLOCK_AIR);
+          }
+        }
+      }
+      springs.push({ x: sx, y: sy, z: sz, basinZ: sz - 1, rate: 4, interval: 3 });
+      extraPlaced++;
+    }
+
+    // ============================================================
     // 2.5. 溶岩だまり（明るさ15の自然光源）を数カ所生成（洞窟内＋岩山の火口・谷）
     // ============================================================
     const lavaPools = [];
@@ -1281,16 +1414,32 @@
       const targetUnits = 7200 * WATER_PER_LEVEL; // 57,600 単位
       let placed = 0;
 
-      // ランドマーク岩山（大オーバーハングの上）に滝の水源を配置
-      for (let x = 73; x <= 77 && placed < targetUnits; x++) {
-        for (let y = 53; y <= 56 && placed < targetUnits; y++) {
-          const z = surfaceHeight[y * WORLD_X + x] + 1;
-          if (z < WORLD_Z && getBlock(x, y, z) === BLOCK_AIR) {
-            const i = index(x, y, z);
-            const add = Math.min(WATER_MAX - water[i], 48);
-            water[i] += add;
-            layerHasWater[z] = 1;
-            placed += add;
+      // 山の上の泉の池 (basinZ) を最初から満水にしておき、起動直後からゆっくり溢れて滝になるようにする
+      for (let s = 0; s < springs.length; s++) {
+        const sp = springs[s];
+        const bz = sp.basinZ !== undefined ? sp.basinZ : sp.z;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const bx = sp.x + dx;
+            const by = sp.y + dy;
+            if (inBounds(bx, by, bz)) {
+              const ib = index(bx, by, bz);
+              if (blocks[ib] === BLOCK_AIR && water[ib] < WATER_MAX) {
+                const add = WATER_MAX - water[ib];
+                water[ib] += add;
+                layerHasWater[bz] = 1;
+                placed += add;
+              }
+            }
+            if (inBounds(bx, by, sp.z)) {
+              const i = index(bx, by, sp.z);
+              if (blocks[i] === BLOCK_AIR && water[i] < WATER_MAX) {
+                const add = Math.min(WATER_MAX - water[i], 20);
+                water[i] += add;
+                layerHasWater[sp.z] = 1;
+                placed += add;
+              }
+            }
           }
         }
       }
@@ -1327,12 +1476,37 @@
     ];
     let simTick = 0;
 
+    let lastTotalMoved = 999;
+
     function stepWater() {
-      if (waterSettled) return false;
+      if (waterSettled && springs.length === 0) return false;
       simTick++;
       falling.fill(0);
 
-      if (simTick % 4 === 1) {
+      let totalMoved = 0;
+      let visualChanged = false;
+
+      // 0. 山の上の泉から少しずつ水が湧き出し続ける
+      for (let s = 0; s < springs.length; s++) {
+        const sp = springs[s];
+        if (simTick % sp.interval !== 0) continue;
+        const si = index(sp.x, sp.y, sp.z);
+        if (blocks[si] === BLOCK_AIR && water[si] < WATER_MAX) {
+          const prevVis = waterToVisualLevel(water[si]);
+          const add = Math.min(sp.rate, WATER_MAX - water[si]);
+          water[si] += add;
+          layerHasWater[sp.z] = 1;
+          waterSettled = false;
+          totalMoved += add;
+          if (waterToVisualLevel(water[si]) !== prevVis) {
+            visualChanged = true;
+            markBlockWaterDirty(sp.z);
+          }
+        }
+      }
+
+      const dropInterval = lastTotalMoved < 250 ? 8 : 4;
+      if (simTick % dropInterval === 1) {
         recomputeActiveDrops();
       }
 
@@ -1343,9 +1517,6 @@
       const yStart = simTick & 2 ? 0 : WORLD_Y - 1;
       const yEnd = simTick & 2 ? WORLD_Y : -1;
       const yStep = simTick & 2 ? 1 : -1;
-
-      let totalMoved = 0;
-      let visualChanged = false;
 
       function transfer(srcIdx, dstIdx, amount, srcZ, dstZ) {
         if (amount <= 0) return;
@@ -1488,23 +1659,72 @@
         layerHasWater[z] = anyInLayer;
       }
 
+      // マップ最外周に到達した水は世界の外の海へ自然に流れ出て、長時間放置しても溢れ続けないようにする
+      for (let z = 0; z < WORLD_Z; z++) {
+        if (!layerHasWater[z]) continue;
+        for (let x = 0; x < WORLD_X; x++) {
+          const iTop = index(x, 0, z);
+          if (water[iTop] > 0) {
+            const pv = waterToVisualLevel(water[iTop]);
+            water[iTop] = Math.max(0, water[iTop] - 4);
+            if (waterToVisualLevel(water[iTop]) !== pv) {
+              visualChanged = true;
+              markBlockWaterDirty(z);
+            }
+          }
+          const iBot = index(x, WORLD_Y - 1, z);
+          if (water[iBot] > 0) {
+            const pv = waterToVisualLevel(water[iBot]);
+            water[iBot] = Math.max(0, water[iBot] - 4);
+            if (waterToVisualLevel(water[iBot]) !== pv) {
+              visualChanged = true;
+              markBlockWaterDirty(z);
+            }
+          }
+        }
+        for (let y = 1; y < WORLD_Y - 1; y++) {
+          const iL = index(0, y, z);
+          if (water[iL] > 0) {
+            const pv = waterToVisualLevel(water[iL]);
+            water[iL] = Math.max(0, water[iL] - 4);
+            if (waterToVisualLevel(water[iL]) !== pv) {
+              visualChanged = true;
+              markBlockWaterDirty(z);
+            }
+          }
+          const iR = index(WORLD_X - 1, y, z);
+          if (water[iR] > 0) {
+            const pv = waterToVisualLevel(water[iR]);
+            water[iR] = Math.max(0, water[iR] - 4);
+            if (waterToVisualLevel(water[iR]) !== pv) {
+              visualChanged = true;
+              markBlockWaterDirty(z);
+            }
+          }
+        }
+      }
+
+      lastTotalMoved = totalMoved;
+
       if (visualChanged) {
         rebuildDirtyWaterSlices();
       }
 
-      if (totalMoved === 0) {
-        calmStreak += 3;
-      } else if (!visualChanged && totalMoved <= 14) {
-        calmStreak++;
-      } else {
-        calmStreak = 0;
-      }
+      if (springs.length === 0) {
+        if (totalMoved === 0) {
+          calmStreak += 3;
+        } else if (!visualChanged && totalMoved <= 14) {
+          calmStreak++;
+        } else {
+          calmStreak = 0;
+        }
 
-      if (calmStreak >= 12) {
-        waterSettled = true;
-        falling.fill(0);
-        dirtyWaterLayers.fill(1);
-        rebuildDirtyWaterSlices();
+        if (calmStreak >= 12) {
+          waterSettled = true;
+          falling.fill(0);
+          dirtyWaterLayers.fill(1);
+          rebuildDirtyWaterSlices();
+        }
       }
 
       return totalMoved > 0;
@@ -1608,6 +1828,10 @@
       caveEntranceX: 66.5,
       caveEntranceY: 64.0,
       caveEntranceZ: 5.0,
+      springViewX: 73.5,
+      springViewY: 54.5,
+      springViewZ: 11.0,
+      springCount: springs.length,
       treeCount: treePositions.length,
       foliageCount,
       flowerCount,

@@ -17,7 +17,11 @@
     drawSingleModelPreview,
   } = global.VoxelWalk;
 
-  let worldSeed = 104729;
+  function makeRandomSeed() {
+    return ((Math.floor(Math.random() * 0x7fffffff) ^ (Date.now() & 0x7fffffff)) >>> 0) % 900000 + 100000;
+  }
+
+  let worldSeed = makeRandomSeed();
   let world = createWorld(worldSeed);
 
   const settings = {
@@ -28,13 +32,14 @@
     useEdgeHighlight: true,
     pixelated: true,
     showWireframe: false,
+    showClouds: true,
     // 洞窟・遮蔽時の X-Ray 透視設定
     xrayMode: 0, // 0=地形輪郭のみ, 1=うっすら半透明, 2=完全切り抜き
     xrayRadiusBlocks: 5.0,
     occlusionFade: 0,
     isOccluded: false,
-    // 昼夜サイクル（0..24時間、デフォルトは昼過ぎ 15:30 からスタートして夕焼け→夜へ自然に移行）
-    timeOfDay: 15.5,
+    // 昼夜サイクル（0..24時間、デフォルトは明け方 05:30 からスタートして朝焼け→爽やかな昼へ）
+    timeOfDay: 5.5,
     autoTime: true,
     sunBrightness: 1.0,
     skyLightColor: [1.0, 0.99, 0.96],
@@ -117,6 +122,7 @@
   const btnReflowWater = document.getElementById("btn-reflow-water");
   const btnRegenWorld = document.getElementById("btn-regen-world");
   const btnGotoCave = document.getElementById("btn-goto-cave");
+  const btnGotoSpring = document.getElementById("btn-goto-spring");
   const btnPlaceTorch = document.getElementById("btn-place-torch");
   const btnRemoveTorch = document.getElementById("btn-remove-torch");
   const valLightInfo = document.getElementById("val-light-info");
@@ -142,12 +148,12 @@
   const chkEdge = document.getElementById("chk-edge");
   const chkPixelated = document.getElementById("chk-pixelated");
   const chkWireframe = document.getElementById("chk-wireframe");
+  const chkClouds = document.getElementById("chk-clouds");
 
   function updateWaterHud() {
     const cur = world.computeCurrentTotalWater();
-    const init = world.getInitialTotalWater();
-    const status = world.isWaterSettled() ? "静止" : "流動中";
-    valWaterTotal.textContent = `${cur} / ${init} (${status})`;
+    const status = world.springCount > 0 ? `泉${world.springCount}ヶ所 湧出中` : (world.isWaterSettled() ? "静止" : "流動中");
+    valWaterTotal.textContent = `${cur} (${status})`;
   }
 
   function syncWorldMeta() {
@@ -155,7 +161,7 @@
     settings.maxVisibleSlice = world.maxUsedSlice;
     sliderCutaway.value = String(world.maxUsedSlice);
     valCutaway.textContent = `${world.maxUsedSlice} / ${world.maxUsedSlice}`;
-    statWorldMeta.textContent = `${world.sizeX}×${world.sizeY}×${world.sizeZ} (溶岩池 ${world.lavaPoolCount} / ベイク ${world.initialBakeMs.toFixed(0)}ms)`;
+    statWorldMeta.textContent = `Seed ${world.seed} · 泉 ${world.springCount} / 溶岩 ${world.lavaPoolCount} (ベイク ${world.initialBakeMs.toFixed(0)}ms)`;
     updateWaterHud();
   }
 
@@ -373,7 +379,7 @@
       clearInterval(preview.buildupTimer);
       preview.buildupTimer = null;
     }
-    worldSeed = (worldSeed * 1103515245 + 12345) & 0x7fffffff;
+    worldSeed = makeRandomSeed();
     world = createWorld(worldSeed);
     syncWorldMeta();
     resetPlayerPosition();
@@ -459,14 +465,15 @@
 
     if (keys["Space"]) {
       if (player.onGround) {
-        player.vz = 7.6;
+        // 2ブロック段差を1回のジャンプで余裕を持って登れる初速（最高到達 約2.4ブロック）
+        player.vz = 10.3;
         player.onGround = false;
       } else if (player.inWater) {
-        player.vz = Math.min(5.2, player.vz + 22 * dt);
+        player.vz = Math.min(6.4, player.vz + 24 * dt);
       }
     }
 
-    const gravity = player.inWater ? 9.5 : 20.0;
+    const gravity = player.inWater ? 9.5 : 22.0;
     player.vz -= gravity * dt;
     if (player.inWater && player.vz < -2.6) {
       player.vz = -2.6;
@@ -755,6 +762,16 @@
     camera.y = player.y;
     camera.z = player.z;
   });
+  btnGotoSpring.addEventListener("click", () => {
+    player.x = world.springViewX;
+    player.y = world.springViewY;
+    player.z = world.springViewZ;
+    player.vz = 0;
+    player.facing = 0;
+    camera.x = player.x;
+    camera.y = player.y;
+    camera.z = player.z;
+  });
 
   function placeTorchAtPlayer() {
     // まず足元、埋まっていれば1歩前方へ設置
@@ -816,6 +833,7 @@
   chkEdge.addEventListener("change", () => (settings.useEdgeHighlight = chkEdge.checked));
   chkPixelated.addEventListener("change", () => (settings.pixelated = chkPixelated.checked));
   chkWireframe.addEventListener("change", () => (settings.showWireframe = chkWireframe.checked));
+  chkClouds.addEventListener("change", () => (settings.showClouds = chkClouds.checked));
 
   btnResetPos.addEventListener("click", resetPlayerPosition);
   btnResetCam.addEventListener("click", resetCameraView);
