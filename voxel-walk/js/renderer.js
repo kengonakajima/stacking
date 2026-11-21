@@ -3,38 +3,34 @@
  * ------------------------------------------------------------
  * WebGL2 インスタンシング・スプライトスタッキング描画エンジン！
  *
- * 【構成】
- * - 地形の全スライス (768x768 x 最大97層) を 1枚の TEXTURE_2D_ARRAY に格納
- * - 8段階の水データ (128x128 x 12層 x RG8 = 393KB) を 1枚の TEXTURE_2D_ARRAY に転送
- *   → 水が流れても変更層だけ texSubImage3D (0.1ms未満) で更新するため、水流中でも60fps！
- * - フラグメントシェーダーで 60fps 連続 Worley/Voronoi 水面コースティクス＋岸辺の白波を計算
- * - プレイヤーより下の層を1コール、上の層を1コール、プレイヤー帯(12層)のみ層ごとにインターリーブし、
- *   128x128x12 ワールド全体＋水＋プレイヤーをわずか ~28 ドローコールで描画します。
+ * 【機能】
+ * - 128x128x14 地形 TEXTURE_2D_ARRAY (RGBA8)
+ * - 水＋溶岩＋松明フラグ TEXTURE_2D_ARRAY (RG8)
+ * - 3D ライトマップ TEXTURE_3D (RG8, LINEAR補間): R=blockLight(松明/溶岩 0..15), G=skyLight(太陽光 0..15)
+ * - 昼夜サイクル対応（夜はほぼ真っ暗、松明と溶岩が16ブロック先まで暖かく照らす）
+ * - 60fps 連続 Worley/Voronoi 水面コースティクス ＋ 溶岩マグマアニメーション ＋ 揺れる松明の炎
+ * - 洞窟・崖裏の X-Ray 外表面透視カットアウト
  */
 (function (global) {
   "use strict";
 
   const { BLOCK_SIZE, BLOCK_SLICES, PLAYER_POSES } = global.VoxelWalk;
 
-  // ============================================================
-  // シェーダーソース（WebGL2 / GLSL ES 3.00）
-  // ============================================================
   const WORLD_VS = `#version 300 es
     precision highp float;
 
-    // 単位クワッド頂点 (0..1)
     layout(location = 0) in vec2 aQuadPos;
 
-    uniform vec2 uViewport;       // (viewW, viewH)
-    uniform vec2 uCenter;         // (centerX, centerY)
-    uniform vec2 uCamXY;          // (cam.x, cam.y) in blocks
-    uniform float uCamBaseSlice;  // cam.z * BLOCK_SLICES
-    uniform vec2 uYawCS;          // (cos(yaw), sin(yaw))
-    uniform float uSquashY;       // sin(pitch)
-    uniform float uLiftPerSlice;  // px per slice
-    uniform float uBlockPx;       // px per block
-    uniform vec4 uCropBlocks;     // (minBx, minBy, maxBx, maxBy)
-    uniform vec2 uWorldSize;      // (128, 128)
+    uniform vec2 uViewport;
+    uniform vec2 uCenter;
+    uniform vec2 uCamXY;
+    uniform float uCamBaseSlice;
+    uniform vec2 uYawCS;
+    uniform float uSquashY;
+    uniform float uLiftPerSlice;
+    uniform float uBlockPx;
+    uniform vec4 uCropBlocks;
+    uniform vec2 uWorldSize;
     uniform int uStartSlice;
 
     out vec2 vBlockPos;
@@ -44,7 +40,6 @@
       int sliceZ = uStartSlice + gl_InstanceID;
       vSliceZ = sliceZ;
 
-      // 可視クロップ矩形内だけをクワッド化（画面外のピクセルフィルを削減）
       vec2 bPos = mix(uCropBlocks.xy, uCropBlocks.zw, aQuadPos);
       vBlockPos = bPos;
 
@@ -64,31 +59,37 @@
   const WORLD_FS = `#version 300 es
     precision highp float;
     precision highp sampler2DArray;
+    precision highp sampler3D;
 
     uniform sampler2DArray uTerrainTex; // 768x768 x N slices (RGBA8)
-    uniform sampler2DArray uWaterTex;   // 128x128 x 14 layers (RG8: R=visLevel 0..8, G=bit0:fall | bit1:solid)
-    uniform vec2 uWorldSize;            // (128, 128)
-    uniform int uWorldZ;                // 14
+    uniform sampler2DArray uWaterTex;   // 128x128 x 14 layers (RG8: R=visLevel 0..8, G=flags: 1=fall, 2=solid, 4=lava, 8=torch)
+    uniform sampler3D uLightTex;        // 128x128 x 14 (RG8, LINEAR: R=blockLight, G=skyLight)
+
+    uniform vec2 uWorldSize;
+    uniform int uWorldZ;
     uniform int uTerrainLayers;
     uniform float uTime;
-    uniform int uMode;                  // 0=地形+水, 1=地形のみ, 2=水のみ
+    uniform int uMode;                  // 0=地形+水+松明, 1=地形のみ, 2=水+松明のみ
     uniform int uWireframe;
 
-    // 洞窟・遮蔽時の X-Ray 透視カットアウト＆松明ライト用 uniform
-    uniform vec2 uPlayerScreenPos;      // プレイヤー中心の画面座標（左下原点 = gl_FragCoord 系）
-    uniform vec3 uPlayerWorldPos;       // プレイヤーの3Dワールド座標（洞窟内の松明ライト用）
-    uniform int uPlayerBaseSlice;       // プレイヤー足元のスライス高さ
-    uniform float uBlockPx;             // 1ブロックの画面ピクセル幅
-    uniform float uOcclusionFade;       // 0.0 (非遮蔽) .. 1.0 (洞窟/崖裏で遮蔽中)
-    uniform float uXrayRadiusPx;        // 透視窓の半径 (px)
-    uniform int uXrayMode;              // 0=輪郭線のみ(外表面), 1=うっすら半透明(外表面1層), 2=完全切り抜き
+    // 昼夜ライティング
+    uniform float uSunBrightness;       // 昼 1.0 -> 夜 0.035
+    uniform vec3 uSkyLightColor;        // 昼:白, 夕:オレンジ, 夜:深い紺
+
+    // 洞窟・遮蔽時の X-Ray 透視カットアウト
+    uniform vec2 uPlayerScreenPos;
+    uniform vec3 uPlayerWorldPos;
+    uniform int uPlayerBaseSlice;
+    uniform float uBlockPx;
+    uniform float uOcclusionFade;
+    uniform float uXrayRadiusPx;
+    uniform int uXrayMode;              // 0=地形輪郭のみ, 1=うっすら半透明, 2=完全切り抜き
 
     in vec2 vBlockPos;
     flat in int vSliceZ;
 
     out vec4 outColor;
 
-    // 60fps 連続 Worley / Voronoi コースティクス（水面の網目模様）
     vec2 hash22(vec2 p) {
       vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
       p3 += dot(p3, p3.yzx + 33.33);
@@ -96,7 +97,6 @@
     }
 
     vec2 waterCaustic(vec2 blockPos, float t) {
-      // ドット絵世界になじむよう 1ブロック=4px グリッドに軽く量子化
       vec2 wp = floor(blockPos * 4.0) * 0.25;
       vec2 p = wp * 0.45;
       vec2 ip = floor(p);
@@ -111,8 +111,7 @@
           float dir = (mod(cell.x + cell.y, 2.0) < 0.5) ? 1.0 : -1.0;
           float ang = h.x * 6.2831853 + t * 0.95 * dir;
           vec2 pt = vec2(float(i), float(j)) + 0.5 + (h - 0.5) * 0.54 + vec2(cos(ang), sin(ang)) * 0.15;
-          vec2 diff = pt - fp;
-          float dist = length(diff);
+          float dist = length(pt - fp);
           if (dist < d1) {
             d2 = d1;
             d1 = dist;
@@ -127,6 +126,21 @@
       return vec2(web * web, cellEdge);
     }
 
+    // 溶岩マグマのゆっくり脈打つ自己発光カラー
+    vec3 lavaColor(vec2 blockPos, float t) {
+      vec2 wp = floor(blockPos * 4.0) * 0.25;
+      float v1 = sin(wp.x * 2.1 + t * 0.9 + sin(wp.y * 1.7 - t * 0.6));
+      float v2 = cos(wp.y * 2.4 - t * 0.7 + cos(wp.x * 1.9 + t * 0.5));
+      float heat = (v1 * 0.5 + v2 * 0.5) * 0.5 + 0.5;
+      vec3 darkCrust = vec3(0.68, 0.14, 0.03);
+      vec3 moltenOrange = vec3(1.0, 0.44, 0.06);
+      vec3 brightCore = vec3(1.0, 0.88, 0.34);
+      if (heat < 0.55) {
+        return mix(darkCrust, moltenOrange, heat / 0.55);
+      }
+      return mix(moltenOrange, brightCore, (heat - 0.55) / 0.45);
+    }
+
     ivec2 sampleWaterCell(ivec2 bxy, int bz) {
       if (bz < 0 || bz >= uWorldZ || bxy.x < 0 || bxy.y < 0 || bxy.x >= int(uWorldSize.x) || bxy.y >= int(uWorldSize.y)) {
         return ivec2(0, 0);
@@ -135,26 +149,64 @@
       return ivec2(int(floor(rg.r * 255.0 + 0.5)), int(floor(rg.g * 255.0 + 0.5)));
     }
 
+    // 3D ライトマップから滑らかな総合照明カラー（太陽光＋16ブロック到達の光源光）を計算
+    vec3 evalWorldLight(vec2 blockPos, int sliceZ) {
+      vec3 luv = vec3(
+        blockPos.x / uWorldSize.x,
+        blockPos.y / uWorldSize.y,
+        clamp((float(sliceZ) / 8.0 + 0.5) / float(uWorldZ), 0.0, 1.0)
+      );
+      vec2 ls = texture(uLightTex, luv).rg; // r = blockLight (0..1), g = skyLight (0..1)
+
+      // Minecraft 風の知覚カーブ（0で完全に暗く、15でしっかり明るい）
+      float bL = pow(ls.r, 1.55);
+      float sL = pow(ls.g, 1.35) * uSunBrightness;
+
+      // 松明・溶岩の暖色光にわずかな炎のゆらぎを足す
+      float flicker = 0.965 + 0.035 * sin(uTime * 6.8 + blockPos.x * 1.3 + blockPos.y * 1.7);
+      vec3 blockCol = vec3(1.12, 0.78, 0.42) * bL * flicker;
+      vec3 skyCol = uSkyLightColor * sL;
+
+      // 夜・深洞窟はほぼ真っ暗（わずかな月明かりベース 0.014 のみ）
+      vec3 baseDark = vec3(0.012, 0.016, 0.026);
+      return min(vec3(1.22), baseDark + skyCol + blockCol * (1.0 - sL * 0.42));
+    }
+
     void main() {
       vec2 uv = vBlockPos / uWorldSize;
       if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) discard;
+
+      int bz = vSliceZ / 8;
+      int lz = vSliceZ - bz * 8;
+      ivec2 bxy = ivec2(floor(vBlockPos));
 
       // 1. 固体地形スライス評価
       if (uMode != 2 && vSliceZ < uTerrainLayers) {
         vec4 tCol = texture(uTerrainTex, vec3(uv, float(vSliceZ)));
         if (tCol.a > 0.5) {
-          // スライス枠デバッグ表示（ブロック境目ごとに薄い枠線）
-          if (uWireframe == 1 && (vSliceZ % 8) == 0) {
-            vec2 edgeDist = min(vBlockPos, uWorldSize - vBlockPos);
-            if (min(edgeDist.x, edgeDist.y) < 0.12) {
-              tCol.rgb = mix(tCol.rgb, vec3(1.0), 0.35);
-            }
+          // 溶岩ブロック判定（自己発光アニメーション：夜でも真っ赤に輝く！）
+          bool isBlockPlane = (lz == 0);
+          int curFlags = sampleWaterCell(bxy, bz).y;
+          bool isLava = (curFlags & 4) != 0;
+          if (!isLava && isBlockPlane && bz > 0 && (curFlags & 2) == 0) {
+            isLava = (sampleWaterCell(bxy, bz - 1).y & 4) != 0;
           }
 
-          // ★ 洞窟・崖裏の X-Ray 透視処理
-          //   - プレイヤーすぐ手前の狭い範囲 (1.35 blk) は膝上から切り抜いて自機を確実に視認
-          //   - 広い透視窓 (uXrayRadiusPx) は頭上 (+12スライス=1.5blk) から切り抜き、
-          //     洞窟の床と周囲の壁をしっかり残しつつ天井の山だけをスッキリ透過させる！
+          vec3 finalRgb;
+          if (isLava) {
+            finalRgb = lavaColor(vBlockPos, uTime) * (isBlockPlane ? 1.12 : 0.92);
+          } else {
+            if (uWireframe == 1 && isBlockPlane) {
+              vec2 edgeDist = min(vBlockPos, uWorldSize - vBlockPos);
+              if (min(edgeDist.x, edgeDist.y) < 0.12) {
+                tCol.rgb = mix(tCol.rgb, vec3(1.0), 0.35);
+              }
+            }
+            vec3 lightCol = evalWorldLight(vBlockPos, vSliceZ);
+            finalRgb = tCol.rgb * lightCol;
+          }
+
+          // 洞窟・崖裏の X-Ray 透視処理（プレイヤーより上の遮蔽ブロックのみ外表面輪郭/半透明化）
           if (uOcclusionFade > 0.01) {
             float screenDist = length(gl_FragCoord.xy - uPlayerScreenPos);
             int cutSlice = (screenDist < uBlockPx * 1.35) ? (uPlayerBaseSlice + 4) : (uPlayerBaseSlice + 12);
@@ -163,90 +215,90 @@
               float mask = (1.0 - smoothstep(uXrayRadiusPx * 0.78, uXrayRadiusPx, screenDist)) * uOcclusionFade;
               if (mask > 0.15) {
                 if (uXrayMode == 2) {
-                  // モード2: 完全切り抜き（洞窟内部が100%くっきり見える）
                   if (mask > 0.45) discard;
-                  outColor = vec4(tCol.rgb, 1.0 - mask * 1.6);
+                  outColor = vec4(finalRgb, 1.0 - mask * 1.6);
                   return;
                 }
 
-                // 山や天井の「一番外側の露出天面（1層だけ）」かどうかを判定
-                // ※ 埋没した内部の何十層ものスライスはすべて discard するため網目だらけにならない！
-                bool isBlockPlane = (vSliceZ % 8) == 0;
-                int curBz = vSliceZ / 8;
-                ivec2 bxy = ivec2(floor(vBlockPos));
                 bool isExposedRoof =
                   isBlockPlane &&
-                  curBz > 0 &&
-                  ((sampleWaterCell(bxy, curBz - 1).y & 2) != 0) &&
-                  ((sampleWaterCell(bxy, curBz).y & 2) == 0);
+                  bz > 0 &&
+                  ((sampleWaterCell(bxy, bz - 1).y & 2) != 0) &&
+                  ((curFlags & 2) == 0);
 
                 if (uXrayMode == 1) {
-                  // モード1: 外表面1層だけをうっすら半透明（フォグ化せず山の形が上品に透ける）
                   if (isExposedRoof) {
-                    outColor = vec4(tCol.rgb, mix(1.0, 0.16, mask));
+                    outColor = vec4(finalRgb, mix(1.0, 0.18, mask));
                     return;
                   }
                   if (mask > 0.45) discard;
-                  outColor = vec4(tCol.rgb, 1.0 - mask * 1.6);
+                  outColor = vec4(finalRgb, 1.0 - mask * 1.6);
                   return;
                 } else {
-                  // モード0 (デフォルト): 外表面の「実際の地形段差（崖・尾根の輪郭）」だけを描く
-                  // 1x1 ブロックごとの細かい格子線は描かず、山の外郭シルエットだけが残る！
                   if (isExposedRoof) {
-                    int roofBz = curBz - 1;
+                    int roofBz = bz - 1;
                     vec2 fxy = fract(vBlockPos);
                     bool edgeW = fxy.x < 0.16 && ((sampleWaterCell(bxy + ivec2(-1, 0), roofBz).y & 2) == 0);
                     bool edgeE = fxy.x > 0.84 && ((sampleWaterCell(bxy + ivec2(1, 0), roofBz).y & 2) == 0);
                     bool edgeN = fxy.y < 0.16 && ((sampleWaterCell(bxy + ivec2(0, -1), roofBz).y & 2) == 0);
                     bool edgeS = fxy.y > 0.84 && ((sampleWaterCell(bxy + ivec2(0, 1), roofBz).y & 2) == 0);
                     if (edgeW || edgeE || edgeN || edgeS) {
-                      vec3 contourCol = mix(tCol.rgb * 1.1, vec3(0.65, 0.92, 1.0), 0.55);
-                      outColor = vec4(contourCol, 0.45 * mask + (1.0 - mask));
+                      vec3 contourCol = mix(finalRgb + vec3(0.18), vec3(0.60, 0.88, 1.0), 0.55);
+                      outColor = vec4(contourCol, 0.42 * mask + (1.0 - mask));
                       return;
                     }
-                    // 窓の外縁（切り抜き境界）に細い淡い縁を残して境目をわかりやすく
                     if (screenDist > uXrayRadiusPx * 0.92) {
-                      outColor = vec4(tCol.rgb, (1.0 - mask) * 0.7);
+                      outColor = vec4(finalRgb, (1.0 - mask) * 0.7);
                       return;
                     }
                     discard;
                   }
                   if (mask > 0.45) discard;
-                  outColor = vec4(tCol.rgb, 1.0 - mask * 1.6);
+                  outColor = vec4(finalRgb, 1.0 - mask * 1.6);
                   return;
                 }
               }
             }
-
-            // ★ 洞窟内の視認性アップ：プレイヤー周囲の床・壁をほんのり暖色の松明ライトで照らす
-            if (vSliceZ < uPlayerBaseSlice + 14) {
-              vec3 fragWorld = vec3(vBlockPos, float(vSliceZ) / 8.0);
-              float d3 = length(fragWorld - (uPlayerWorldPos + vec3(0.0, 0.0, 0.8)));
-              float torch = clamp(1.0 - d3 / 6.5, 0.0, 1.0);
-              torch = torch * torch * uOcclusionFade;
-              tCol.rgb *= (1.0 + torch * vec3(0.58, 0.46, 0.24));
-            }
           }
 
-          outColor = vec4(tCol.rgb, 1.0);
+          outColor = vec4(finalRgb, 1.0);
           return;
         }
       }
 
       if (uMode == 1) discard;
 
-      // 2. 水スライス評価（内部はほぼ透明、露出水面だけ控えめな Worley 網目＋岸辺の白波）
-      int bz = vSliceZ / 8;
-      int lz = vSliceZ - bz * 8;
-      ivec2 bxy = ivec2(floor(vBlockPos));
-
       ivec2 curW = sampleWaterCell(bxy, bz);
       int visLevel = curW.x;
       int flags = curW.y;
       bool curSolid = (flags & 2) != 0;
       bool isFalling = (flags & 1) != 0;
+      bool isTorch = (flags & 8) != 0;
 
-      // 露出水面チェック
+      // 2. 設置された松明の 3D 描画（木の柄＋ゆらめく自己発光の炎！）
+      if (isTorch && bz < uWorldZ) {
+        vec2 fxy = fract(vBlockPos) - 0.5;
+        if (lz <= 4) {
+          // 木の柄
+          if (abs(fxy.x) < 0.11 && abs(fxy.y) < 0.11) {
+            outColor = vec4(0.58, 0.36, 0.16, 1.0);
+            return;
+          }
+        } else if (lz <= 7) {
+          // 揺れる炎（自己発光）
+          float swayX = sin(uTime * 11.0 + vBlockPos.x * 7.0) * 0.03 * float(lz - 4);
+          float swayY = cos(uTime * 9.5 + vBlockPos.y * 5.0) * 0.03 * float(lz - 4);
+          float dFlame = length(fxy - vec2(swayX, swayY));
+          float rMax = 0.21 - float(lz - 5) * 0.045;
+          if (dFlame < rMax) {
+            vec3 flameCol = dFlame < rMax * 0.55 ? vec3(1.0, 0.96, 0.65) : vec3(1.0, 0.56, 0.12);
+            outColor = vec4(flameCol, 1.0);
+            return;
+          }
+        }
+      }
+
+      // 3. 水スライス評価（昼夜＆松明・溶岩の光も反映！）
       bool isSurface = false;
       int surfBz = bz;
       if (lz > 0 && bz < uWorldZ && visLevel == lz) {
@@ -271,7 +323,6 @@
         );
         float alpha = (48.0 + cellEdge * 22.0 + webSharp * 68.0) / 255.0;
 
-        // WebGL ならでは：岸辺（固体ブロックと接する縁 0.18ブロック幅）に穏やかなさざ波ハイライト
         vec2 fxy = fract(vBlockPos);
         float shore = 0.0;
         if (fxy.x < 0.18 && (sampleWaterCell(bxy + ivec2(-1, 0), surfBz).y & 2) != 0) shore = max(shore, 1.0 - fxy.x / 0.18);
@@ -286,17 +337,18 @@
           alpha = min(0.75, alpha + foam * 0.35);
         }
 
-        outColor = vec4(rgb, alpha);
+        vec3 lightCol = evalWorldLight(vBlockPos, vSliceZ);
+        outColor = vec4(rgb * lightCol, alpha);
         return;
       }
 
-      // 水の体積（中はほぼ透明な深い青、滝は泡立ったシアン）
       if (bz < uWorldZ && visLevel >= lz + 1) {
+        vec3 lightCol = evalWorldLight(vBlockPos, vSliceZ);
         if (isFalling) {
           float streak = 0.85 + 0.15 * sin(uTime * 9.0 + float(vSliceZ) * 0.9 + vBlockPos.x * 3.0);
-          outColor = vec4(vec3(0.34, 0.78, 0.95) * streak, 0.25);
+          outColor = vec4(vec3(0.34, 0.78, 0.95) * streak * lightCol, 0.25);
         } else {
-          outColor = vec4(0.04, 0.36, 0.68, 0.078);
+          outColor = vec4(vec3(0.04, 0.36, 0.68) * lightCol, 0.078);
         }
         return;
       }
@@ -305,11 +357,11 @@
     }
   `;
 
-  // プレイヤー＆接地影用シェーダー
+  // プレイヤー＆接地影用シェーダー（同じ 3D ライトマップで照らす）
   const SPRITE_VS = `#version 300 es
     precision highp float;
 
-    layout(location = 0) in vec2 aQuadPos; // 0..1
+    layout(location = 0) in vec2 aQuadPos;
 
     uniform vec2 uViewport;
     uniform vec2 uCenter;
@@ -358,6 +410,7 @@
     uniform int uIsShadow;
     uniform float uShadowAlpha;
     uniform int uShowBox;
+    uniform vec3 uPlayerTint;
 
     in vec2 vUV;
     out vec4 outColor;
@@ -380,13 +433,10 @@
 
       vec4 col = texture(uPlayerTex, vec3(vUV, float(uPlayerLayer)));
       if (col.a < 0.5) discard;
-      outColor = col;
+      outColor = vec4(col.rgb * uPlayerTint, col.a);
     }
   `;
 
-  // ============================================================
-  // WebGL2 リソース管理
-  // ============================================================
   function compileShader(gl, type, src) {
     const sh = gl.createShader(type);
     gl.shaderSource(sh, src);
@@ -429,7 +479,6 @@
     const worldProg = createProgram(gl, WORLD_VS, WORLD_FS);
     const spriteProg = createProgram(gl, SPRITE_VS, SPRITE_FS);
 
-    // 単位クワッド VAO (2三角形 = 6頂点)
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
     const vbo = gl.createBuffer();
@@ -443,7 +492,6 @@
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     gl.bindVertexArray(null);
 
-    // Uniform ロケーションキャッシュ
     const wLoc = {
       uViewport: gl.getUniformLocation(worldProg, "uViewport"),
       uCenter: gl.getUniformLocation(worldProg, "uCenter"),
@@ -458,11 +506,14 @@
       uStartSlice: gl.getUniformLocation(worldProg, "uStartSlice"),
       uTerrainTex: gl.getUniformLocation(worldProg, "uTerrainTex"),
       uWaterTex: gl.getUniformLocation(worldProg, "uWaterTex"),
+      uLightTex: gl.getUniformLocation(worldProg, "uLightTex"),
       uWorldZ: gl.getUniformLocation(worldProg, "uWorldZ"),
       uTerrainLayers: gl.getUniformLocation(worldProg, "uTerrainLayers"),
       uTime: gl.getUniformLocation(worldProg, "uTime"),
       uMode: gl.getUniformLocation(worldProg, "uMode"),
       uWireframe: gl.getUniformLocation(worldProg, "uWireframe"),
+      uSunBrightness: gl.getUniformLocation(worldProg, "uSunBrightness"),
+      uSkyLightColor: gl.getUniformLocation(worldProg, "uSkyLightColor"),
       uPlayerScreenPos: gl.getUniformLocation(worldProg, "uPlayerScreenPos"),
       uPlayerWorldPos: gl.getUniformLocation(worldProg, "uPlayerWorldPos"),
       uPlayerBaseSlice: gl.getUniformLocation(worldProg, "uPlayerBaseSlice"),
@@ -489,9 +540,9 @@
       uIsShadow: gl.getUniformLocation(spriteProg, "uIsShadow"),
       uShadowAlpha: gl.getUniformLocation(spriteProg, "uShadowAlpha"),
       uShowBox: gl.getUniformLocation(spriteProg, "uShowBox"),
+      uPlayerTint: gl.getUniformLocation(spriteProg, "uPlayerTint"),
     };
 
-    // プレイヤーテクスチャ配列 (8x8 x 36: idle 0..11, stepA 12..23, stepB 24..35)
     const pSliceCount = PLAYER_POSES.rawIdle.length;
     const playerTex = gl.createTexture();
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -520,13 +571,14 @@
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-    // ワールド地形＆水テクスチャ状態
     let boundWorld = null;
     let boundTerrainKey = "";
     let terrainTex = null;
     let terrainLayers = 0;
     let waterTex = null;
     let uploadedWaterVer = -1;
+    let lightTex = null;
+    let uploadedLightVer = -1;
     let lastPixelated = true;
 
     function syncTerrainTexture(world, useAO, useEdge) {
@@ -547,19 +599,7 @@
       const emptyBuf = new Uint8Array(w * h * 4);
       for (let z = 0; z < layers; z++) {
         const bytes = pack.slices[z] || emptyBuf;
-        gl.texSubImage3D(
-          gl.TEXTURE_2D_ARRAY,
-          0,
-          0,
-          0,
-          z,
-          w,
-          h,
-          1,
-          gl.RGBA,
-          gl.UNSIGNED_BYTE,
-          bytes
-        );
+        gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, z, w, h, 1, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
       }
 
       const filt = lastPixelated ? gl.NEAREST : gl.LINEAR;
@@ -615,6 +655,43 @@
       return uploadedLayers;
     }
 
+    function syncLightTexture(world) {
+      if (boundWorld !== world || !lightTex) {
+        if (lightTex) gl.deleteTexture(lightTex);
+        lightTex = gl.createTexture();
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.bindTexture(gl.TEXTURE_3D, lightTex);
+        gl.texStorage3D(gl.TEXTURE_3D, 1, gl.RG8, world.sizeX, world.sizeY, world.sizeZ);
+        // GL_LINEAR で滑らかな Minecraft 風スムースライティングを実現！
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+        uploadedLightVer = -1;
+      }
+
+      const curVer = world.getLightTexVersion();
+      if (curVer !== uploadedLightVer) {
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.bindTexture(gl.TEXTURE_3D, lightTex);
+        gl.texSubImage3D(
+          gl.TEXTURE_3D,
+          0,
+          0,
+          0,
+          0,
+          world.sizeX,
+          world.sizeY,
+          world.sizeZ,
+          gl.RG,
+          gl.UNSIGNED_BYTE,
+          world.lightTexBytes
+        );
+        uploadedLightVer = curVer;
+      }
+    }
+
     function updateFilterMode(pixelated) {
       if (pixelated === lastPixelated) return;
       lastPixelated = pixelated;
@@ -634,6 +711,7 @@
 
       syncTerrainTexture(world, settings.useAO, settings.useEdgeHighlight);
       const waterUploaded = syncWaterTexture(world);
+      syncLightTexture(world);
       boundWorld = world;
       updateFilterMode(settings.pixelated);
 
@@ -667,7 +745,6 @@
       const playerBaseSlice = Math.round(player.z * BLOCK_SLICES);
       const playerMaxSlice = playerBaseSlice + pSliceCount - 1;
 
-      // プレイヤー胴体中心のスクリーン座標（WebGL gl_FragCoord は左下原点なので Y を反転）
       const pRelX = (player.x - cam.x) * blockScreenPx;
       const pRelY = (player.y - cam.y) * blockScreenPx;
       const pScreenX = centerX + (pRelX * cosYaw - pRelY * sinYaw);
@@ -679,6 +756,17 @@
       const occlusionFade = settings.occlusionFade || 0;
       const xrayMode = settings.xrayMode !== undefined ? settings.xrayMode : 0;
 
+      const sunBrightness = settings.sunBrightness !== undefined ? settings.sunBrightness : 1.0;
+      const skyLightColor = settings.skyLightColor || [1.0, 0.99, 0.96];
+
+      // プレイヤー自身の受光色（真っ暗な夜でもキャラの位置がうっすら分かる最小値 0.14 を確保）
+      const pLight = world.getLightAt(player.x, player.y, player.z + 0.8);
+      const pbL = Math.pow(pLight.block / 15, 1.55);
+      const psL = Math.pow(pLight.sky / 15, 1.35) * sunBrightness;
+      const pTintR = Math.min(1.2, Math.max(0.14, skyLightColor[0] * psL + 1.12 * pbL * (1 - psL * 0.4)));
+      const pTintG = Math.min(1.2, Math.max(0.15, skyLightColor[1] * psL + 0.78 * pbL * (1 - psL * 0.4)));
+      const pTintB = Math.min(1.2, Math.max(0.20, skyLightColor[2] * psL + 0.44 * pbL * (1 - psL * 0.4)));
+
       const floorInfo = world.findFloorBelow(player.x, player.y, player.z + 0.05);
       const shadowSliceZ = Math.round(floorInfo.floorZ * BLOCK_SLICES);
 
@@ -688,7 +776,6 @@
           ? fullTopSlice
           : settings.maxVisibleSlice;
 
-      // 画面4隅を最下層(0)と最上層(limitZ-1)へ逆投影して全体の可視ブロック矩形を求める
       const invBlockPx = 1 / blockScreenPx;
       const invSquashY = 1 / squashY;
       let minBx = world.sizeX;
@@ -737,7 +824,6 @@
 
       gl.bindVertexArray(vao);
 
-      // 共通 uniform 設定用ヘルパー
       let worldDrawCalls = 0;
       let waterDrawCalls = 0;
       let miscDrawCalls = 0;
@@ -753,6 +839,9 @@
         gl.activeTexture(gl.TEXTURE1);
         gl.bindTexture(gl.TEXTURE_2D_ARRAY, waterTex);
         gl.uniform1i(wLoc.uWaterTex, 1);
+        gl.activeTexture(gl.TEXTURE3);
+        gl.bindTexture(gl.TEXTURE_3D, lightTex);
+        gl.uniform1i(wLoc.uLightTex, 3);
 
         gl.uniform2f(wLoc.uViewport, viewW, viewH);
         gl.uniform2f(wLoc.uCenter, centerX, centerY);
@@ -768,6 +857,8 @@
         gl.uniform1i(wLoc.uTerrainLayers, terrainLayers);
         gl.uniform1f(wLoc.uTime, timeSec);
         gl.uniform1i(wLoc.uWireframe, settings.showWireframe ? 1 : 0);
+        gl.uniform1f(wLoc.uSunBrightness, sunBrightness);
+        gl.uniform3f(wLoc.uSkyLightColor, skyLightColor[0], skyLightColor[1], skyLightColor[2]);
         gl.uniform2f(wLoc.uPlayerScreenPos, pScreenX, pFragY);
         gl.uniform3f(wLoc.uPlayerWorldPos, player.x, player.y, player.z);
         gl.uniform1i(wLoc.uPlayerBaseSlice, playerBaseSlice);
@@ -794,6 +885,7 @@
         gl.uniform1f(sLoc.uBlockPx, blockScreenPx);
         gl.uniform2f(sLoc.uSpriteBlockXY, player.x, player.y);
         gl.uniform2f(sLoc.uFacingCS, Math.cos(player.facing), Math.sin(player.facing));
+        gl.uniform3f(sLoc.uPlayerTint, pTintR, pTintG, pTintB);
       }
 
       function drawWorldBatch(startZ, count, mode) {
@@ -812,7 +904,7 @@
         const shadowScale = Math.max(0.45, 1 - heightAboveFloor * 0.22);
         useSpriteProgram();
         gl.uniform1i(sLoc.uIsShadow, 1);
-        gl.uniform1f(sLoc.uShadowAlpha, 0.34 * shadowScale);
+        gl.uniform1f(sLoc.uShadowAlpha, 0.34 * shadowScale * Math.max(0.25, sunBrightness));
         gl.uniform1f(sLoc.uSpriteSizeBlocks, 0.72 * shadowScale);
         gl.uniform1i(sLoc.uSliceZ, shadowSliceZ);
         gl.uniform1i(sLoc.uShowBox, 0);
@@ -820,37 +912,26 @@
         miscDrawCalls++;
       }
 
-      // ============================================================
-      // 【超軽量インターリーブ描画】
-      //  1) プレイヤー足元より下を一括 1〜2 インスタンスコールで描画
-      //  2) プレイヤーの存在する12層のみ層ごとに地形→プレイヤー→水を描画
-      //  3) プレイヤー頭上（岩山・トンネル天井・木）を一括 1 インスタンスコールで描画！
-      // ============================================================
       const pStart = Math.max(0, Math.min(limitZ, playerBaseSlice));
       const pEnd = Math.max(pStart, Math.min(limitZ, playerMaxSlice + 1));
 
-      // 1) プレイヤーより下の層（接地影がプレイヤーより下にある場合は影の位置で分割）
       if (floorInfo.floorZ > 0 && shadowSliceZ < pStart) {
         drawWorldBatch(0, shadowSliceZ, 0);
-        drawWorldBatch(shadowSliceZ, 1, 1); // 床天面
+        drawWorldBatch(shadowSliceZ, 1, 1);
         drawShadowQuad();
-        drawWorldBatch(shadowSliceZ, 1, 2); // 床面上の水
+        drawWorldBatch(shadowSliceZ, 1, 2);
         drawWorldBatch(shadowSliceZ + 1, pStart - (shadowSliceZ + 1), 0);
       } else {
         drawWorldBatch(0, pStart, 0);
       }
 
-      // 2) プレイヤー帯 (最大12スライス)
       for (let z = pStart; z < pEnd; z++) {
-        // 地形のみ
         drawWorldBatch(z, 1, 1);
 
-        // 影（足元と同じ高さにある場合）
         if (z === shadowSliceZ && floorInfo.floorZ > 0) {
           drawShadowQuad();
         }
 
-        // プレイヤースライス
         useSpriteProgram();
         gl.uniform1i(sLoc.uIsShadow, 0);
         gl.uniform1i(sLoc.uPlayerLayer, poseIdx * pSliceCount + (z - playerBaseSlice));
@@ -860,11 +941,9 @@
         gl.drawArrays(gl.TRIANGLES, 0, 6);
         miscDrawCalls++;
 
-        // 水のみ（プレイヤーより後に描くことで水中では半透明の水に透けて見える）
         drawWorldBatch(z, 1, 2);
       }
 
-      // 3) プレイヤーより上の層すべてを 1 回の drawArraysInstanced で一括描画！
       if (pEnd < limitZ) {
         drawWorldBatch(pEnd, limitZ - pEnd, 0);
       }
@@ -889,9 +968,6 @@
     return { render };
   }
 
-  /**
-   * 右側観察パネル用：単体モデルのスタッキング描画（軽量なCanvas 2Dのまま維持）
-   */
   function drawSingleModelPreview(ctx, model, opts) {
     const pitchRad = (opts.pitchDeg * Math.PI) / 180;
     const squashY = Math.sin(pitchRad);

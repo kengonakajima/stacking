@@ -18,6 +18,7 @@
     BLOCK_LEAVES,
     BLOCK_STONE,
     BLOCK_DARK_STONE,
+    BLOCK_LAVA,
     hash3,
     sampleBlockColor24,
     shadePacked24ToABGR,
@@ -106,6 +107,9 @@
     const blocks = new Uint8Array(cellCount);
     const water = new Uint8Array(cellCount);
     const falling = new Uint8Array(cellCount);
+    const torches = new Uint8Array(cellCount); // 1 = 松明が置かれている（明るさ15）
+    const skyLight = new Uint8Array(cellCount); // 0..15（太陽光）
+    const blockLight = new Uint8Array(cellCount); // 0..15（松明・溶岩の光、15ブロック＝半径16マス伝播）
     const surfaceHeight = new Uint8Array(WORLD_X * WORLD_Y);
     const biomeMap = new Float32Array(WORLD_X * WORLD_Y);
 
@@ -311,6 +315,68 @@
       }
     }
 
+    // ============================================================
+    // 2.5. 溶岩だまり（明るさ15の自然光源）を数カ所生成（洞窟内＋岩山の火口・谷）
+    // ============================================================
+    const lavaPools = [];
+
+    function placeLavaPool(cx, cy, zLevel, radiusX, radiusY, openSky) {
+      let count = 0;
+      const rxI = Math.ceil(radiusX) + 1;
+      const ryI = Math.ceil(radiusY) + 1;
+      for (let dy = -ryI; dy <= ryI; dy++) {
+        for (let dx = -rxI; dx <= rxI; dx++) {
+          const lx = cx + dx;
+          const ly = cy + dy;
+          if (!inBounds(lx, ly, zLevel)) continue;
+          const norm = (dx * dx) / (radiusX * radiusX) + (dy * dy) / (radiusY * radiusY);
+          const jitter = (hash3(lx, ly, seed + 555) - 0.5) * 0.35;
+          if (norm + jitter <= 1.0) {
+            // 溶岩の底は深岩で支える
+            if (zLevel > 0) setBlock(lx, ly, zLevel - 1, BLOCK_DARK_STONE);
+            setBlock(lx, ly, zLevel, BLOCK_LAVA);
+            // 溶岩の直上を空けて光とマグマ模様が見えるようにする
+            const clearTop = openSky ? WORLD_Z - 1 : Math.min(WORLD_Z - 2, zLevel + 2);
+            for (let cz = zLevel + 1; cz <= clearTop; cz++) {
+              setBlock(lx, ly, cz, BLOCK_AIR);
+            }
+            count++;
+          } else if (norm <= 1.65) {
+            // 溶岩だまりの縁を深岩の岩縁にして水と混ざりにくくする
+            if (getBlock(lx, ly, zLevel) === BLOCK_AIR || getBlock(lx, ly, zLevel) === BLOCK_GRASS) {
+              setBlock(lx, ly, zLevel, BLOCK_DARK_STONE);
+            }
+          }
+        }
+      }
+      if (count > 0) lavaPools.push({ x: cx, y: cy, z: zLevel, blocks: count });
+    }
+
+    // ① ランドマーク・スパゲッティ洞窟の奥（歩いていくと赤い溶岩の光が見えてくる！）
+    placeLavaPool(84, 71, 2, 2.2, 1.8, false);
+    // ② スタート北東の岩山火口・峡谷（夜になると遠くからでも赤く輝く！）
+    placeLavaPool(90, 56, 5, 2.6, 2.2, true);
+    // ③ さらにマップ内の岩山・地下洞窟に 5カ所の溶岩だまりを点在させる
+    const lavaCandidates = [
+      { x: 102, y: 84, r: 2.5, open: true },
+      { x: 96, y: 32, r: 2.3, open: true },
+      { x: 74, y: 98, r: 2.2, open: true },
+      { x: 42, y: 38, r: 2.1, open: false }, // 地下スパゲッティ洞窟の溶岩だまり
+      { x: 34, y: 92, r: 2.4, open: true },
+    ];
+    for (const cand of lavaCandidates) {
+      let zPick = 2;
+      if (cand.open) {
+        for (let z = WORLD_Z - 2; z >= 2; z--) {
+          if (getBlock(cand.x, cand.y, z) !== BLOCK_AIR) {
+            zPick = Math.max(2, Math.min(6, z));
+            break;
+          }
+        }
+      }
+      placeLavaPool(cand.x, cand.y, zPick, cand.r, cand.r * 0.85, cand.open);
+    }
+
     // 3. 露出している土ブロックの上面を草ブロックへ変換し、surfaceHeight と solidBlockCount を確定
     let solidBlockCount = 0;
     for (let y = 0; y < WORLD_Y; y++) {
@@ -439,6 +505,7 @@
     BURIED_COLORS[BLOCK_DARK_STONE] = packRGBA(52, 56, 66, 255);
     BURIED_COLORS[BLOCK_WOOD] = packRGBA(76, 52, 32, 255);
     BURIED_COLORS[BLOCK_LEAVES] = packRGBA(36, 90, 36, 255);
+    BURIED_COLORS[BLOCK_LAVA] = packRGBA(230, 76, 16, 255);
 
     const bakeStartMs = performance.now();
 
@@ -773,6 +840,242 @@
       }
     }
 
+    // 7. Minecraft式 3D BFS 光源伝播エンジン（skyLight 0..15 ＋ blockLight 0..15 = 16ブロック到達）
+    // ============================================================
+    // GPU 3D テクスチャ用バッファ (128x128x14 x RG8 = 458KB): R = blockLight, G = skyLight
+    const lightTexBytes = new Uint8Array(cellCount * 2);
+    const lightQueue = new Int32Array(cellCount);
+    let lightTexVersion = 0;
+    let torchCount = 0;
+
+    function recomputeSkyLight() {
+      skyLight.fill(0);
+      let qHead = 0;
+      let qTail = 0;
+
+      // 1. 空から真下へ直射日光 (15) を落とす（葉ブロックは少しだけ減衰して木漏れ日を通す）
+      for (let y = 0; y < WORLD_Y; y++) {
+        for (let x = 0; x < WORLD_X; x++) {
+          let colLight = 15;
+          for (let z = WORLD_Z - 1; z >= 0; z--) {
+            const i = index(x, y, z);
+            const b = blocks[i];
+            if (b === BLOCK_AIR) {
+              if (water[i] > 0) colLight = Math.max(0, colLight - 1);
+              skyLight[i] = colLight;
+              if (colLight > 1) lightQueue[qTail++] = i;
+            } else if (b === BLOCK_LEAVES) {
+              colLight = Math.max(0, colLight - 3);
+            } else {
+              break;
+            }
+          }
+        }
+      }
+
+      // 2. 3D BFS で洞窟の入口やオーバーハングの下へ太陽光が滑らかに回り込む
+      const layerStride = WORLD_X * WORLD_Y;
+      while (qHead < qTail) {
+        const i = lightQueue[qHead++];
+        const curL = skyLight[i];
+        if (curL <= 1) continue;
+        const nextL = curL - 1;
+
+        const z = (i / layerStride) | 0;
+        const rem = i - z * layerStride;
+        const y = (rem / WORLD_X) | 0;
+        const x = rem - y * WORLD_X;
+
+        if (x + 1 < WORLD_X) {
+          const ni = i + 1;
+          if (blocks[ni] === BLOCK_AIR && skyLight[ni] < nextL) { skyLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+        if (x > 0) {
+          const ni = i - 1;
+          if (blocks[ni] === BLOCK_AIR && skyLight[ni] < nextL) { skyLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+        if (y + 1 < WORLD_Y) {
+          const ni = i + WORLD_X;
+          if (blocks[ni] === BLOCK_AIR && skyLight[ni] < nextL) { skyLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+        if (y > 0) {
+          const ni = i - WORLD_X;
+          if (blocks[ni] === BLOCK_AIR && skyLight[ni] < nextL) { skyLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+        if (z + 1 < WORLD_Z) {
+          const ni = i + layerStride;
+          if (blocks[ni] === BLOCK_AIR && skyLight[ni] < nextL) { skyLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+        if (z > 0) {
+          const ni = i - layerStride;
+          if (blocks[ni] === BLOCK_AIR && skyLight[ni] < nextL) { skyLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+      }
+    }
+
+    function recomputeBlockLight() {
+      blockLight.fill(0);
+      let qHead = 0;
+      let qTail = 0;
+
+      // 1. すべての光源（松明 = 15、溶岩ブロック = 15）をシード登録
+      for (let i = 0; i < cellCount; i++) {
+        if (torches[i] || blocks[i] === BLOCK_LAVA) {
+          blockLight[i] = 15;
+          lightQueue[qTail++] = i;
+        }
+      }
+
+      // 2. 3D BFS で固体ブロックに遮られながら最大15〜16ブロック先まで光を伝播
+      const layerStride = WORLD_X * WORLD_Y;
+      while (qHead < qTail) {
+        const i = lightQueue[qHead++];
+        const curL = blockLight[i];
+        if (curL <= 1) continue;
+        const nextL = curL - 1;
+
+        const z = (i / layerStride) | 0;
+        const rem = i - z * layerStride;
+        const y = (rem / WORLD_X) | 0;
+        const x = rem - y * WORLD_X;
+
+        if (x + 1 < WORLD_X) {
+          const ni = i + 1;
+          if (blocks[ni] === BLOCK_AIR && blockLight[ni] < nextL) { blockLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+        if (x > 0) {
+          const ni = i - 1;
+          if (blocks[ni] === BLOCK_AIR && blockLight[ni] < nextL) { blockLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+        if (y + 1 < WORLD_Y) {
+          const ni = i + WORLD_X;
+          if (blocks[ni] === BLOCK_AIR && blockLight[ni] < nextL) { blockLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+        if (y > 0) {
+          const ni = i - WORLD_X;
+          if (blocks[ni] === BLOCK_AIR && blockLight[ni] < nextL) { blockLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+        if (z + 1 < WORLD_Z) {
+          const ni = i + layerStride;
+          if (blocks[ni] === BLOCK_AIR && blockLight[ni] < nextL) { blockLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+        if (z > 0) {
+          const ni = i - layerStride;
+          if (blocks[ni] === BLOCK_AIR && blockLight[ni] < nextL) { blockLight[ni] = nextL; lightQueue[qTail++] = ni; }
+        }
+      }
+    }
+
+    /**
+     * 空気セルの光をそのまま格納し、固体ブロックセルには「隣接する非固体セルの最大光量」を焼き込む。
+     * これにより壁を貫通せずに、床・壁・プレイヤー・水面すべてが滑らかなライトマップで照らされる。
+     */
+    function packLightTexture() {
+      const layerStride = WORLD_X * WORLD_Y;
+      for (let z = 0; z < WORLD_Z; z++) {
+        for (let y = 0; y < WORLD_Y; y++) {
+          for (let x = 0; x < WORLD_X; x++) {
+            const i = (z * WORLD_Y + y) * WORLD_X + x;
+            const b = blocks[i];
+            let bL = blockLight[i];
+            let sL = skyLight[i];
+
+            if (b === BLOCK_LAVA) {
+              bL = 15;
+              sL = 15;
+            } else if (b !== BLOCK_AIR) {
+              // 固体ブロックは周囲6近傍の非固体セルの光量最大値を受け取る
+              bL = 0;
+              sL = 0;
+              if (z + 1 < WORLD_Z && blocks[i + layerStride] === BLOCK_AIR) {
+                const nb = blockLight[i + layerStride], ns = skyLight[i + layerStride];
+                if (nb > bL) bL = nb;
+                if (ns > sL) sL = ns;
+              }
+              if (z > 0 && blocks[i - layerStride] === BLOCK_AIR) {
+                const nb = blockLight[i - layerStride], ns = skyLight[i - layerStride];
+                if (nb > bL) bL = nb;
+                if (ns > sL) sL = ns;
+              }
+              if (x + 1 < WORLD_X && blocks[i + 1] === BLOCK_AIR) {
+                const nb = blockLight[i + 1], ns = skyLight[i + 1];
+                if (nb > bL) bL = nb;
+                if (ns > sL) sL = ns;
+              }
+              if (x > 0 && blocks[i - 1] === BLOCK_AIR) {
+                const nb = blockLight[i - 1], ns = skyLight[i - 1];
+                if (nb > bL) bL = nb;
+                if (ns > sL) sL = ns;
+              }
+              if (y + 1 < WORLD_Y && blocks[i + WORLD_X] === BLOCK_AIR) {
+                const nb = blockLight[i + WORLD_X], ns = skyLight[i + WORLD_X];
+                if (nb > bL) bL = nb;
+                if (ns > sL) sL = ns;
+              }
+              if (y > 0 && blocks[i - WORLD_X] === BLOCK_AIR) {
+                const nb = blockLight[i - WORLD_X], ns = skyLight[i - WORLD_X];
+                if (nb > bL) bL = nb;
+                if (ns > sL) sL = ns;
+              }
+            }
+
+            lightTexBytes[i * 2] = bL * 17; // 0..15 -> 0..255
+            lightTexBytes[i * 2 + 1] = sL * 17;
+          }
+        }
+      }
+      lightTexVersion++;
+    }
+
+    function placeTorchAt(wx, wy, wz) {
+      const bx = Math.floor(wx);
+      const by = Math.floor(wy);
+      const bz = Math.floor(wz);
+      if (!inBounds(bx, by, bz)) return false;
+      const i = index(bx, by, bz);
+      if (blocks[i] !== BLOCK_AIR || torches[i]) return false;
+      torches[i] = 1;
+      torchCount++;
+      markBlockWaterDirty(bz);
+      rebuildDirtyWaterSlices();
+      recomputeBlockLight();
+      packLightTexture();
+      return true;
+    }
+
+    function removeTorchNear(wx, wy, wz) {
+      const cx = Math.floor(wx);
+      const cy = Math.floor(wy);
+      const cz = Math.floor(wz);
+      for (let dz = -1; dz <= 1; dz++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const bx = cx + dx, by = cy + dy, bz = cz + dz;
+            if (!inBounds(bx, by, bz)) continue;
+            const i = index(bx, by, bz);
+            if (torches[i]) {
+              torches[i] = 0;
+              torchCount--;
+              markBlockWaterDirty(bz);
+              rebuildDirtyWaterSlices();
+              recomputeBlockLight();
+              packLightTexture();
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    }
+
+    function getLightAt(wx, wy, wz) {
+      const bx = Math.max(0, Math.min(WORLD_X - 1, Math.floor(wx)));
+      const by = Math.max(0, Math.min(WORLD_Y - 1, Math.floor(wy)));
+      const bz = Math.max(0, Math.min(WORLD_Z - 1, Math.floor(wz)));
+      const i = index(bx, by, bz);
+      return { block: blockLight[i], sky: skyLight[i] };
+    }
+
     function rebuildDirtyWaterSlices() {
       let anyUpdated = false;
       for (let bz = 0; bz < WORLD_Z; bz++) {
@@ -782,7 +1085,13 @@
         for (let p = 0; p < WORLD_X * WORLD_Y; p++) {
           const idx = baseIdx + p;
           const visLevel = waterToVisualLevel(water[idx]);
-          const flags = (falling[idx] ? 1 : 0) | (blocks[idx] !== BLOCK_AIR ? 2 : 0);
+          // Gチャンネルフラグ: bit0=滝落下, bit1=固体, bit2=溶岩, bit3=松明
+          const b = blocks[idx];
+          const flags =
+            (falling[idx] ? 1 : 0) |
+            (b !== BLOCK_AIR ? 2 : 0) |
+            (b === BLOCK_LAVA ? 4 : 0) |
+            (torches[idx] ? 8 : 0);
           out[p * 2] = visLevel;
           out[p * 2 + 1] = flags;
         }
@@ -1087,6 +1396,15 @@
     }
 
     resetWaterToHighlands();
+    // 初期の松明をスタート広場と洞窟入口に1本ずつ置いて、夜や洞窟の雰囲気をすぐ体感できるようにする
+    torches[index(62, 64, spawnZ)] = 1;
+    torches[index(67, 64, 5)] = 1;
+    torchCount = 2;
+    dirtyWaterLayers.fill(1);
+    rebuildDirtyWaterSlices();
+    recomputeSkyLight();
+    recomputeBlockLight();
+    packLightTexture();
 
     return {
       seed,
@@ -1104,6 +1422,7 @@
       caveEntranceY: 64.0,
       caveEntranceZ: 5.0,
       treeCount: treePositions.length,
+      lavaPoolCount: lavaPools.length,
       solidBlockCount,
       spaghettiCarvedCount,
       initialBakeMs,
@@ -1118,6 +1437,12 @@
       waterLayerBytes,
       dirtyWaterLayers,
       getWaterTexVersion: () => waterTexVersion,
+      lightTexBytes,
+      getLightTexVersion: () => lightTexVersion,
+      placeTorchAt,
+      removeTorchNear,
+      getTorchCount: () => torchCount,
+      getLightAt,
       stepWater,
       resetWaterToHighlands,
       getWaterLevelAt,

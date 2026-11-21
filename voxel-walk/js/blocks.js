@@ -21,6 +21,7 @@
   const BLOCK_LEAVES = 4;
   const BLOCK_STONE = 5;
   const BLOCK_DARK_STONE = 6;
+  const BLOCK_LAVA = 7;
 
   const BLOCK_NAMES = {
     [BLOCK_AIR]: "空中",
@@ -30,6 +31,7 @@
     [BLOCK_LEAVES]: "葉ブロック",
     [BLOCK_STONE]: "岩ブロック",
     [BLOCK_DARK_STONE]: "深岩ブロック",
+    [BLOCK_LAVA]: "溶岩ブロック",
   };
 
   // 高速な整数ハッシュ
@@ -199,6 +201,14 @@
       else if (n > 0.18) { r = 72; g = 78; b = 90; }
       else { r = 56; g = 62; b = 74; }
       return pack24(r + strata, g + strata, b + strata, faceLight);
+    }
+
+    // ===== 溶岩ブロック（明るさ15の自己発光マグマ） =====
+    if (blockType === BLOCK_LAVA) {
+      if (n > 0.78) return pack24(255, 224, 92, 1.0);
+      if (n > 0.42) return pack24(255, 122, 24, 1.0);
+      if (n > 0.16) return pack24(222, 58, 12, 1.0);
+      return pack24(142, 28, 10, 1.0);
     }
 
     return 0xff00ff;
@@ -648,7 +658,7 @@
   const previewModels = {
     grass: buildPreviewBlockModel(BLOCK_GRASS, "grass", "草ブロック"),
     stone: buildPreviewBlockModel(BLOCK_STONE, "stone", "岩ブロック"),
-    darkStone: buildPreviewBlockModel(BLOCK_DARK_STONE, "darkStone", "深岩ブロック"),
+    lava: buildPreviewBlockModel(BLOCK_LAVA, "lava", "溶岩ブロック (光15)"),
     wood: buildPreviewBlockModel(BLOCK_WOOD, "wood", "木の幹"),
     water: buildPreviewWaterModel(),
     player: {
@@ -671,6 +681,7 @@
   global.VoxelWalk.BLOCK_LEAVES = BLOCK_LEAVES;
   global.VoxelWalk.BLOCK_STONE = BLOCK_STONE;
   global.VoxelWalk.BLOCK_DARK_STONE = BLOCK_DARK_STONE;
+  global.VoxelWalk.BLOCK_LAVA = BLOCK_LAVA;
   global.VoxelWalk.BLOCK_NAMES = BLOCK_NAMES;
   global.VoxelWalk.hash3 = hash3;
   global.VoxelWalk.sampleBlockColor24 = sampleBlockColor24;

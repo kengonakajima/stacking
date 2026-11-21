@@ -121,24 +121,55 @@ html, body {
 
 #hud-fps {
   display: inline-block;
-  width: 48px;
+  width: 46px;
   color: var(--accent);
+}
+
+#hud-time {
+  display: inline-block;
+  width: 68px;
+  color: var(--warning);
 }
 
 #hud-pos {
   display: inline-block;
-  width: 118px;
+  width: 112px;
 }
 
 #hud-ground {
   display: inline-block;
-  width: 82px;
+  width: 78px;
 }
 
 #hud-biome {
   display: inline-block;
-  width: 72px;
+  width: 68px;
   color: var(--sky-accent);
+}
+
+.btn-torch {
+  background: #b45309;
+  color: #fef3c7;
+  border-color: #f59e0b;
+}
+
+.btn-torch:hover {
+  background: #d97706;
+}
+
+.chip-torch {
+  border-color: rgba(251, 191, 36, 0.55);
+  color: #fde68a;
+  background: rgba(217, 119, 6, 0.2);
+}
+
+.inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-sub);
+  cursor: pointer;
 }
 
 .hud-actions {

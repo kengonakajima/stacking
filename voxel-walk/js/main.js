@@ -28,10 +28,15 @@
     pixelated: true,
     showWireframe: false,
     // 洞窟・遮蔽時の X-Ray 透視設定
-    xrayMode: 0, // 0=輪郭線+半透明, 1=輪郭線のみ, 2=半透明のみ
+    xrayMode: 0, // 0=地形輪郭のみ, 1=うっすら半透明, 2=完全切り抜き
     xrayRadiusBlocks: 5.0,
     occlusionFade: 0,
     isOccluded: false,
+    // 昼夜サイクル（0..24時間、デフォルトは昼過ぎ 15:30 からスタートして夕焼け→夜へ自然に移行）
+    timeOfDay: 15.5,
+    autoTime: true,
+    sunBrightness: 1.0,
+    skyLightColor: [1.0, 0.99, 0.96],
   };
 
   const camera = {
@@ -76,15 +81,18 @@
   // ============================================================
   // DOM 要素取得
   // ============================================================
+  const viewportPane = document.querySelector(".viewport-pane");
   const worldCanvas = document.getElementById("world-canvas");
   const glRenderer = createWebGLRenderer(worldCanvas);
   const previewCanvas = document.getElementById("preview-canvas");
   const previewCtx = previewCanvas.getContext("2d");
 
   const hudFps = document.getElementById("hud-fps");
+  const hudTime = document.getElementById("hud-time");
   const hudPos = document.getElementById("hud-pos");
   const hudGround = document.getElementById("hud-ground");
   const hudBiome = document.getElementById("hud-biome");
+  const btnPlaceTorchHud = document.getElementById("btn-place-torch-hud");
   const btnResetPos = document.getElementById("btn-reset-pos");
   const btnResetCam = document.getElementById("btn-reset-cam");
 
@@ -108,6 +116,12 @@
   const btnReflowWater = document.getElementById("btn-reflow-water");
   const btnRegenWorld = document.getElementById("btn-regen-world");
   const btnGotoCave = document.getElementById("btn-goto-cave");
+  const btnPlaceTorch = document.getElementById("btn-place-torch");
+  const btnRemoveTorch = document.getElementById("btn-remove-torch");
+  const valLightInfo = document.getElementById("val-light-info");
+  const sliderTime = document.getElementById("slider-time");
+  const valTime = document.getElementById("val-time");
+  const chkAutoTime = document.getElementById("chk-auto-time");
   const sliderXrayRadius = document.getElementById("slider-xray-radius");
   const valXrayRadius = document.getElementById("val-xray-radius");
   const badgeOcclusion = document.getElementById("badge-occlusion");
@@ -140,8 +154,96 @@
     settings.maxVisibleSlice = world.maxUsedSlice;
     sliderCutaway.value = String(world.maxUsedSlice);
     valCutaway.textContent = `${world.maxUsedSlice} / ${world.maxUsedSlice}`;
-    statWorldMeta.textContent = `${world.sizeX}×${world.sizeY}×${world.sizeZ} (洞窟 ${world.spaghettiCarvedCount.toLocaleString()} / ベイク ${world.initialBakeMs.toFixed(0)}ms)`;
+    statWorldMeta.textContent = `${world.sizeX}×${world.sizeY}×${world.sizeZ} (溶岩池 ${world.lavaPoolCount} / ベイク ${world.initialBakeMs.toFixed(0)}ms)`;
     updateWaterHud();
+  }
+
+  // ============================================================
+  // 昼夜サイクル計算（時刻 0..24h → 太陽光強度・空色・背景グラデーション）
+  // ============================================================
+  function lerp(a, b, t) {
+    return a + (b - a) * t;
+  }
+
+  function lerpRGB(c1, c2, t) {
+    return [
+      Math.round(lerp(c1[0], c2[0], t)),
+      Math.round(lerp(c1[1], c2[1], t)),
+      Math.round(lerp(c1[2], c2[2], t)),
+    ];
+  }
+
+  let lastBgKey = "";
+
+  function updateDayNightLighting() {
+    const h = ((settings.timeOfDay % 24) + 24) % 24;
+    let sun = 1.0;
+    let lightCol = [1.0, 0.99, 0.96];
+    let bgTop = [93, 169, 233];
+    let bgBot = [184, 225, 255];
+
+    if (h >= 8 && h < 16) {
+      // 昼
+      sun = 1.0;
+      lightCol = [1.0, 0.99, 0.96];
+      bgTop = [93, 169, 233];
+      bgBot = [184, 225, 255];
+    } else if (h >= 16 && h < 19.5) {
+      // 夕方（16:00 -> 19:30）
+      const t = (h - 16) / 3.5;
+      if (t < 0.55) {
+        const u = t / 0.55;
+        sun = lerp(1.0, 0.42, u);
+        lightCol = [lerp(1.0, 1.08, u), lerp(0.99, 0.64, u), lerp(0.96, 0.38, u)];
+        bgTop = lerpRGB([93, 169, 233], [46, 36, 92], u);
+        bgBot = lerpRGB([184, 225, 255], [236, 114, 52], u);
+      } else {
+        const u = (t - 0.55) / 0.45;
+        sun = lerp(0.42, 0.032, u);
+        lightCol = [lerp(1.08, 0.24, u), lerp(0.64, 0.34, u), lerp(0.38, 0.58, u)];
+        bgTop = lerpRGB([46, 36, 92], [3, 6, 15], u);
+        bgBot = lerpRGB([236, 114, 52], [9, 16, 34], u);
+      }
+    } else if (h >= 19.5 || h < 4.5) {
+      // 夜（ほぼ真っ暗！）
+      sun = 0.032;
+      lightCol = [0.24, 0.34, 0.58];
+      bgTop = [3, 6, 15];
+      bgBot = [9, 16, 34];
+    } else {
+      // 夜明け（4:30 -> 8:00）
+      const t = (h - 4.5) / 3.5;
+      if (t < 0.45) {
+        const u = t / 0.45;
+        sun = lerp(0.032, 0.45, u);
+        lightCol = [lerp(0.24, 1.05, u), lerp(0.34, 0.72, u), lerp(0.58, 0.48, u)];
+        bgTop = lerpRGB([3, 6, 15], [38, 54, 108], u);
+        bgBot = lerpRGB([9, 16, 34], [244, 158, 72], u);
+      } else {
+        const u = (t - 0.45) / 0.55;
+        sun = lerp(0.45, 1.0, u);
+        lightCol = [lerp(1.05, 1.0, u), lerp(0.72, 0.99, u), lerp(0.48, 0.96, u)];
+        bgTop = lerpRGB([38, 54, 108], [93, 169, 233], u);
+        bgBot = lerpRGB([244, 158, 72], [184, 225, 255], u);
+      }
+    }
+
+    settings.sunBrightness = sun;
+    settings.skyLightColor = lightCol;
+
+    const hh = String(Math.floor(h)).padStart(2, "0");
+    const mm = String(Math.floor((h - Math.floor(h)) * 60)).padStart(2, "0");
+    const label = h >= 19.5 || h < 4.5 ? "夜" : h >= 16 ? "夕" : h < 8 ? "朝" : "昼";
+    const timeText = `${hh}:${mm} (${label})`;
+    hudTime.textContent = timeText;
+    valTime.textContent = timeText;
+    sliderTime.value = h.toFixed(2);
+
+    const bgKey = `${bgTop[0]},${bgTop[1]},${bgBot[0]},${bgBot[1]}`;
+    if (bgKey !== lastBgKey && viewportPane) {
+      lastBgKey = bgKey;
+      viewportPane.style.background = `linear-gradient(180deg, rgb(${bgTop.join(",")}) 0%, rgb(${bgBot.join(",")}) 100%)`;
+    }
   }
 
   /**
@@ -405,6 +507,10 @@
     }
     badgeOcclusion.textContent = occluded ? "透視ON（遮蔽中）" : "待機中（屋外）";
     badgeOcclusion.classList.toggle("active", occluded);
+
+    // 現在位置の明るさ (0..15) と松明本数を表示
+    const curLight = world.getLightAt(player.x, player.y, player.z + 0.3);
+    valLightInfo.textContent = `光 ${curLight.block}/15 · 空 ${curLight.sky}/15 (松明 ${world.getTorchCount()}本)`;
   }
 
   // ============================================================
@@ -617,6 +723,32 @@
     camera.z = player.z;
   });
 
+  function placeTorchAtPlayer() {
+    // まず足元、埋まっていれば1歩前方へ設置
+    if (world.placeTorchAt(player.x, player.y, player.z + 0.1)) return;
+    world.placeTorchAt(player.x + Math.cos(player.facing) * 0.9, player.y + Math.sin(player.facing) * 0.9, player.z + 0.1);
+  }
+
+  btnPlaceTorch.addEventListener("click", placeTorchAtPlayer);
+  btnPlaceTorchHud.addEventListener("click", placeTorchAtPlayer);
+  btnRemoveTorch.addEventListener("click", () => {
+    world.removeTorchNear(player.x, player.y, player.z + 0.3);
+  });
+
+  sliderTime.addEventListener("input", () => {
+    settings.timeOfDay = parseFloat(sliderTime.value);
+    updateDayNightLighting();
+  });
+  document.querySelectorAll("[data-time]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      settings.timeOfDay = parseFloat(btn.dataset.time);
+      updateDayNightLighting();
+    });
+  });
+  chkAutoTime.addEventListener("change", () => {
+    settings.autoTime = chkAutoTime.checked;
+  });
+
   document.querySelectorAll("[data-xray]").forEach((btn) => {
     btn.addEventListener("click", () => {
       settings.xrayMode = parseInt(btn.dataset.xray, 10);
@@ -662,6 +794,10 @@
     keys[ev.code] = true;
     if (ev.code === "KeyR") {
       resetPlayerPosition();
+    } else if (ev.code === "KeyF") {
+      placeTorchAtPlayer();
+    } else if (ev.code === "KeyX") {
+      world.removeTorchNear(player.x, player.y, player.z + 0.3);
     }
   });
   window.addEventListener("keyup", (ev) => {
@@ -703,6 +839,12 @@
       fpsFrames = 0;
       fpsWindowStart = now;
     }
+
+    // 昼夜サイクル進行（1日24時間 = 約96秒）
+    if (settings.autoTime) {
+      settings.timeOfDay = (settings.timeOfDay + dt * 0.25) % 24;
+    }
+    updateDayNightLighting();
 
     updatePlayer(dt);
 
