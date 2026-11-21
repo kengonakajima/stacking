@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Voxel Walk — スプライトスタッキング・ボクセルワールド</title>
+  <title>Voxel Walk 128 — スプライトスタッキング・ボクセルワールド</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -12,19 +12,23 @@
     <main class="viewport-pane">
       <header class="hud-bar">
         <div class="hud-left">
-          <h1 class="app-title">VOXEL WALK <span class="badge">SPRITE STACKING</span></h1>
+          <h1 class="app-title">VOXEL WALK <span class="badge">128×128</span></h1>
           <div class="stat-group">
             <div class="stat">
+              <span class="stat-label">FPS</span>
+              <span id="hud-fps" class="stat-value">60 fps</span>
+            </div>
+            <div class="stat">
               <span class="stat-label">POS</span>
-              <span id="hud-pos" class="stat-value">10.0, 10.0, 2.0</span>
+              <span id="hud-pos" class="stat-value">60.5, 64.5, 3.0</span>
             </div>
             <div class="stat">
               <span class="stat-label">足元</span>
               <span id="hud-ground" class="stat-value">草ブロック</span>
             </div>
             <div class="stat">
-              <span class="stat-label">YAW / PITCH</span>
-              <span id="hud-cam" class="stat-value">45° / 45°</span>
+              <span class="stat-label">地帯</span>
+              <span id="hud-biome" class="stat-value">森の渓谷</span>
             </div>
           </div>
         </div>
@@ -37,62 +41,81 @@
       <div class="canvas-stage">
         <canvas id="world-canvas"></canvas>
         <div class="floating-hint">
-          画面ドラッグで360°カメラ回転・傾き変更 ／ スクロールでズーム
+          東へ進むと大トンネル＆オーバーハング岩山 ／ ドラッグで回転・スクロールでズーム
         </div>
       </div>
 
       <footer class="controls-bar">
         <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / <kbd>↑↓←→</kbd> 歩く</span>
-        <span><kbd>Space</kbd> ジャンプ</span>
-        <span><kbd>Q</kbd> / <kbd>E</kbd> カメラ回転</span>
+        <span><kbd>Space</kbd> ジャンプ / 泳ぐ</span>
+        <span><kbd>Q</kbd> / <kbd>E</kbd> 回転</span>
         <span><kbd>ドラッグ</kbd> 自由視点</span>
+        <span><kbd>ホイール</kbd> ズーム</span>
         <span><kbd>R</kbd> 初期位置</span>
       </footer>
     </main>
 
-    <!-- 右側: ボクセル×スプライトスタッキング観察パネル -->
+    <!-- 右側: 描画統計・ワールド制御・モデル観察パネル -->
     <aside class="inspector-pane">
+      <!-- 0. 描画パフォーマンス統計 -->
       <section class="panel-section">
         <div class="section-header">
-          <h2>1. 単体モデル分解プレビュー</h2>
-          <span class="hint">各ブロックの2Dスライス</span>
+          <h2>1. 描画統計（パフォーマンス）</h2>
+          <span class="hint">リアルタイム計測</span>
         </div>
-
-        <div class="model-tabs" id="model-tabs">
-          <button class="tab-btn active" data-model="grass">草ブロック</button>
-          <button class="tab-btn" data-model="dirt">土ブロック</button>
-          <button class="tab-btn" data-model="wood">木の幹</button>
-          <button class="tab-btn" data-model="leaves">葉ブロック</button>
-          <button class="tab-btn" data-model="water">水 (8段階)</button>
-          <button class="tab-btn" data-model="player">プレイヤー</button>
+        <div class="perf-grid">
+          <div class="perf-card">
+            <span class="perf-label">フレームレート</span>
+            <span id="stat-fps" class="perf-val perf-accent">60.0 fps</span>
+          </div>
+          <div class="perf-card">
+            <span class="perf-label">描画時間 / Frame</span>
+            <span id="stat-render-ms" class="perf-val">0.00 ms</span>
+          </div>
+          <div class="perf-card">
+            <span class="perf-label">ドローコール数</span>
+            <span id="stat-draw-total" class="perf-val perf-sky">0 calls</span>
+          </div>
+          <div class="perf-card">
+            <span class="perf-label">水流計算 / Step</span>
+            <span id="stat-water-ms" class="perf-val">0.00 ms</span>
+          </div>
         </div>
-
-        <div class="preview-box">
-          <canvas id="preview-canvas" width="320" height="165"></canvas>
-          <div class="preview-caption" id="preview-caption">草ブロック：10枚の2D断面を積み上げ</div>
+        <div class="perf-rows">
+          <div class="perf-row">
+            <span>内訳 (Calls)</span>
+            <span id="stat-draw-break" class="mono-sub">地形 0 / 水 0 / 他 0</span>
+          </div>
+          <div class="perf-row">
+            <span>描画スライス数</span>
+            <span id="stat-slices" class="mono-sub">0 / 0</span>
+          </div>
+          <div class="perf-row">
+            <span>画面内クロップ面積</span>
+            <span id="stat-crop" class="mono-sub">100%</span>
+          </div>
+          <div class="perf-row">
+            <span>ワールド規模</span>
+            <span id="stat-world-meta" class="mono-sub">128×128×12</span>
+          </div>
         </div>
-
-        <div class="sheet-header">
-          <span>2Dスライス一覧（底 Z=0 → 頂上）</span>
-          <span id="hover-layer-info" class="layer-badge">層にカーソルで強調</span>
-        </div>
-        <div id="slice-grid" class="slice-grid"></div>
       </section>
 
+      <!-- 2. ワールド＆水流コントロール -->
       <section class="panel-section">
         <div class="section-header">
-          <h2>2. 64×64 ワールド &amp; 水流コントロール</h2>
+          <h2>2. 128×128 ワールド &amp; 水流</h2>
           <span class="hint">リアルタイム反映</span>
         </div>
 
         <div class="control-block">
           <div class="control-label-row">
-            <span>水の総量（テラリア式保存）</span>
-            <span id="val-water-total" class="mono-val">3400 / 3400 (一定)</span>
+            <span>水の総量（内部64段階保存）</span>
+            <span id="val-water-total" class="mono-val">57600 / 57600 (流動中)</span>
           </div>
           <div class="preset-row">
             <button id="btn-reflow-water" class="chip-btn chip-accent">💧 高所から流し直す</button>
-            <button id="btn-regen-world" class="chip-btn">🌲 新しい地形を生成</button>
+            <button id="btn-regen-world" class="chip-btn">🏔 新しい地形を生成</button>
           </div>
         </div>
 
@@ -111,10 +134,10 @@
 
         <div class="control-block">
           <div class="control-label-row">
-            <label for="slider-cutaway">高さカット（輪切り観察）</label>
+            <label for="slider-cutaway">高さカット（トンネル内部も観察）</label>
             <span id="val-cutaway" class="mono-val">全層</span>
           </div>
-          <input id="slider-cutaway" type="range" min="1" max="60" step="1" value="60" />
+          <input id="slider-cutaway" type="range" min="1" max="97" step="1" value="97" />
           <div class="preset-row">
             <button id="btn-buildup" class="chip-btn chip-accent">▶ 下から積み上げ再生</button>
             <button id="btn-cutaway-full" class="chip-btn">全層表示</button>
@@ -162,22 +185,32 @@
         </div>
       </section>
 
+      <!-- 3. 単体モデル分解プレビュー -->
       <section class="panel-section">
         <div class="section-header">
-          <h2>3. ボクセル×スタッキングの仕組み</h2>
+          <h2>3. 単体モデル分解プレビュー</h2>
+          <span class="hint">各ブロックの2Dスライス</span>
         </div>
-        <p class="explain-text">
-          64×64×10 の世界を<strong>高さごとの2D水平断面キャンバス（<code>worldSlices[z]</code>）</strong>に焼き込み、
-          半透明の<strong>8段階水スライス</strong>（1〜8層＝水深1/8〜8/8）とスクロールする水面波紋、
-          さらにプレイヤーを同じ高さ <code>z</code> で差し込んで重ねています。
-        </p>
-        <pre class="code-snippet"><code>// js/renderer.js の核心ループ
-for (let z = 0; z &lt; limitZ; z++) {
-  drawSlice(worldSlices[z], z);      // 地形・木
-  drawPlayerSliceIfInRange(z);       // プレイヤー
-  drawWaterBody(waterBodySlices[z]); // 半透明水体積
-  drawWaterSurfaceAnim(z, frame);    // 波紋アニメ水面
-}</code></pre>
+
+        <div class="model-tabs" id="model-tabs">
+          <button class="tab-btn active" data-model="grass">草ブロック</button>
+          <button class="tab-btn" data-model="stone">岩ブロック</button>
+          <button class="tab-btn" data-model="darkStone">深岩</button>
+          <button class="tab-btn" data-model="wood">木の幹</button>
+          <button class="tab-btn" data-model="water">水 (8段階)</button>
+          <button class="tab-btn" data-model="player">プレイヤー</button>
+        </div>
+
+        <div class="preview-box">
+          <canvas id="preview-canvas" width="320" height="150"></canvas>
+          <div class="preview-caption" id="preview-caption">草ブロック：8枚の2D断面を積み上げ</div>
+        </div>
+
+        <div class="sheet-header">
+          <span>2Dスライス一覧（底 Z=0 → 頂上）</span>
+          <span id="hover-layer-info" class="layer-badge">層にカーソルで強調</span>
+        </div>
+        <div id="slice-grid" class="slice-grid"></div>
       </section>
     </aside>
   </div>

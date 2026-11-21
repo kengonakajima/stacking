@@ -119,19 +119,26 @@ html, body {
   white-space: nowrap;
 }
 
+#hud-fps {
+  display: inline-block;
+  width: 48px;
+  color: var(--accent);
+}
+
 #hud-pos {
   display: inline-block;
-  width: 112px;
+  width: 118px;
 }
 
 #hud-ground {
   display: inline-block;
-  width: 88px;
+  width: 82px;
 }
 
-#hud-cam {
+#hud-biome {
   display: inline-block;
-  width: 78px;
+  width: 72px;
+  color: var(--sky-accent);
 }
 
 .hud-actions {
@@ -261,6 +268,70 @@ kbd {
 .hint {
   font-size: 11px;
   color: var(--text-sub);
+}
+
+/* 描画統計パネル */
+.perf-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.perf-card {
+  background: #0f1724;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.perf-label {
+  font-size: 10px;
+  color: var(--text-sub);
+}
+
+.perf-val {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.perf-accent {
+  color: var(--accent);
+}
+
+.perf-sky {
+  color: var(--sky-accent);
+}
+
+.perf-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(44, 60, 84, 0.7);
+}
+
+.perf-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text-sub);
+  gap: 8px;
+}
+
+.mono-sub {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text-main);
+  text-align: right;
 }
 
 .model-tabs {

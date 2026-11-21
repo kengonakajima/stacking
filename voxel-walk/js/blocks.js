@@ -1,16 +1,17 @@
 /**
  * blocks.js
  * ------------------------------------------------------------
- * ボクセルブロック（土 / 草 / 木の幹 / 葉 / 水）とプレイヤーキャラクターの
- * 2Dスライス（輪切りテクスチャ）、および水のアニメーションテクスチャを生成します。
+ * 128x128 ワールド用のボクセルブロック（土 / 草 / 木の幹 / 葉 / 岩 / 深岩 / 水）と
+ * プレイヤーキャラクター、周期 Worley/Voronoi 水面コースティクスを生成します。
  *
- * 1ブロック = 8x8 ピクセル（水平） × 8 スライス（高さ）の立方体。
- * 水の8段階の深さ (1..8) がそのまま 1..8 スライスに 1対1 で対応します。
+ * 1ブロック = 6x6 ピクセル（水平） × 8 スライス（高さ）。
+ * 描画時に縦横比を補正して完全な 1:1:1 立方体として描きつつ、
+ * 水の8段階の深さ (1..8) がそのまま 1..8 スライスに対応します。
  */
 (function (global) {
   "use strict";
 
-  const BLOCK_SIZE = 8; // 1ブロックの水平ピクセル幅 (8x8)
+  const BLOCK_SIZE = 6; // 1ブロックの水平ピクセル幅 (6x6 -> 128ブロックで 768x768)
   const BLOCK_SLICES = 8; // 1ブロックの高さスライス枚数 (0..7) = 水の8段階と一致
 
   const BLOCK_AIR = 0;
@@ -18,6 +19,8 @@
   const BLOCK_GRASS = 2;
   const BLOCK_WOOD = 3;
   const BLOCK_LEAVES = 4;
+  const BLOCK_STONE = 5;
+  const BLOCK_DARK_STONE = 6;
 
   const BLOCK_NAMES = {
     [BLOCK_AIR]: "空中",
@@ -25,9 +28,11 @@
     [BLOCK_GRASS]: "草ブロック",
     [BLOCK_WOOD]: "木の幹",
     [BLOCK_LEAVES]: "葉ブロック",
+    [BLOCK_STONE]: "岩ブロック",
+    [BLOCK_DARK_STONE]: "深岩ブロック",
   };
 
-  // 高速な整数ハッシュ（64x64 ワールド生成・ベイクを高速化）
+  // 高速な整数ハッシュ
   function hash3(x, y, z) {
     let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(z | 0, 1274126177)) | 0;
     h = Math.imul(h ^ (h >>> 13), 1274126177);
@@ -35,32 +40,50 @@
   }
 
   /**
-   * 明暗係数 factor を適用する。暗くなるほどわずかに寒色（青み）へ寄せることで、
-   * 影が濁らず空の環境光を受けた立体的な陰影になる。
+   * 寒色シャドウ付き明暗計算 → 32bit リトルエンディアン ABGR パック（ゼロアロケーション）
    */
-  function shadeColor(r, g, b, factor) {
-    const shadow = Math.max(0, 1 - factor);
+  function shadeAndPackABGR(r, g, b, factor) {
+    const shadow = factor < 1 ? 1 - factor : 0;
     const rMult = factor * (1 - shadow * 0.14);
     const gMult = factor * (1 - shadow * 0.03);
     const bMult = factor * (1 + shadow * 0.18);
-    return [
-      Math.min(255, Math.max(0, Math.round(r * rMult))),
-      Math.min(255, Math.max(0, Math.round(g * gMult))),
-      Math.min(255, Math.max(0, Math.round(b * bMult))),
-    ];
+    let cr = (r * rMult + 0.5) | 0;
+    let cg = (g * gMult + 0.5) | 0;
+    let cb = (b * bMult + 0.5) | 0;
+    if (cr < 0) cr = 0; else if (cr > 255) cr = 255;
+    if (cg < 0) cg = 0; else if (cg > 255) cg = 255;
+    if (cb < 0) cb = 0; else if (cb > 255) cb = 255;
+    return (255 << 24) | (cb << 16) | (cg << 8) | cr;
   }
 
   /**
-   * ブロック内のローカル座標 (lx, ly, lz) の基本色 [r, g, b] を返す。
-   * isTopFace が true のときはブロック上面（天面キャップ）として明るく描画する。
+   * 24bit RGB (0xRRGGBB) に対して明暗を掛け、32bit ABGR を返す（ゼロアロケーション）
    */
-  function sampleBlockColor(blockType, lx, ly, lz, variantSeed, isTopFace) {
+  function shadePacked24ToABGR(rgb24, factor) {
+    const r = (rgb24 >>> 16) & 255;
+    const g = (rgb24 >>> 8) & 255;
+    const b = rgb24 & 255;
+    return shadeAndPackABGR(r, g, b, factor);
+  }
+
+  function pack24(r, g, b, factor) {
+    const abgr = shadeAndPackABGR(r, g, b, factor);
+    const cr = abgr & 255;
+    const cg = (abgr >>> 8) & 255;
+    const cb = (abgr >>> 16) & 255;
+    return (cr << 16) | (cg << 8) | cb;
+  }
+
+  /**
+   * ブロック内のローカル座標 (lx, ly, lz) の基本色を 24bit RGB (0xRRGGBB) で返す（高速・配列確保なし）
+   */
+  function sampleBlockColor24(blockType, lx, ly, lz, variantSeed, isTopFace) {
     const topFace = isTopFace !== undefined ? isTopFace : lz === BLOCK_SLICES - 1;
     const n = hash3(lx + variantSeed * 13, ly + variantSeed * 7, lz + variantSeed * 5);
     const isEdge = lx === 0 || lx === BLOCK_SIZE - 1 || ly === 0 || ly === BLOCK_SIZE - 1;
     const isNearEdge = lx <= 1 || lx >= BLOCK_SIZE - 2 || ly <= 1 || ly >= BLOCK_SIZE - 2;
 
-    // 面の向きによる明暗差（上面を明るく、垂直の側面をしっかり暗くする）
+    // 面の向きによる明暗差
     let faceLight = 1.0;
     if (topFace) {
       faceLight = 1.06;
@@ -71,13 +94,16 @@
         const dEast = BLOCK_SIZE - 1 - lx;
         const dNorth = ly;
         const dSouth = BLOCK_SIZE - 1 - ly;
-        const minD = Math.min(dWest, dEast, dNorth, dSouth);
+        let minD = dWest;
+        if (dEast < minD) minD = dEast;
+        if (dNorth < minD) minD = dNorth;
+        if (dSouth < minD) minD = dSouth;
 
         let dirLight = 1.0;
-        if (dWest === minD) dirLight = Math.min(dirLight, 0.50); // 西面
-        if (dNorth === minD) dirLight = Math.min(dirLight, 0.58); // 北面
-        if (dSouth === minD) dirLight = Math.min(dirLight, 0.68); // 南面
-        if (dEast === minD) dirLight = Math.min(dirLight, 0.76); // 東面
+        if (dWest === minD && 0.50 < dirLight) dirLight = 0.50;
+        if (dNorth === minD && 0.58 < dirLight) dirLight = 0.58;
+        if (dSouth === minD && 0.68 < dirLight) dirLight = 0.68;
+        if (dEast === minD && 0.76 < dirLight) dirLight = 0.76;
         sideLight = dirLight;
       }
       const heightGrad = 0.80 + (Math.min(lz, BLOCK_SLICES - 1) / (BLOCK_SLICES - 1)) * 0.24;
@@ -87,16 +113,11 @@
     // ===== 土ブロック =====
     if (blockType === BLOCK_DIRT) {
       let r, g, b;
-      if (n > 0.91) {
-        r = 128; g = 120; b = 112;
-      } else if (n > 0.66) {
-        r = 148; g = 102; b = 66;
-      } else if (n > 0.30) {
-        r = 128; g = 86; b = 54;
-      } else {
-        r = 104; g = 68; b = 42;
-      }
-      return shadeColor(r, g, b, faceLight);
+      if (n > 0.91) { r = 128; g = 120; b = 112; }
+      else if (n > 0.66) { r = 148; g = 102; b = 66; }
+      else if (n > 0.30) { r = 128; g = 86; b = 54; }
+      else { r = 104; g = 68; b = 42; }
+      return pack24(r, g, b, faceLight);
     }
 
     // ===== 草ブロック =====
@@ -107,20 +128,19 @@
         else if (n > 0.40) { r = 92; g = 176; b = 62; }
         else if (n > 0.14) { r = 74; g = 152; b = 50; }
         else { r = 62; g = 134; b = 44; }
-        return shadeColor(r, g, b, faceLight);
+        return pack24(r, g, b, faceLight);
       }
 
-      // 側面の草の垂れ下がり（ギザギザ草フリンジ）
       if (lz === BLOCK_SLICES - 3 && isNearEdge) {
         const overhang = hash3(lx * 3 + variantSeed, ly * 3 + variantSeed, 99);
-        if (overhang > 0.36) {
-          return shadeColor(n > 0.5 ? 82 : 64, n > 0.5 ? 162 : 138, n > 0.5 ? 54 : 45, faceLight);
+        if (overhang > 0.38) {
+          return pack24(n > 0.5 ? 82 : 64, n > 0.5 ? 162 : 138, n > 0.5 ? 54 : 45, faceLight);
         }
       }
       if (lz === BLOCK_SLICES - 4 && isEdge) {
         const drip = hash3(lx * 5 + variantSeed, ly * 5 + variantSeed, 77);
         if (drip > 0.74) {
-          return shadeColor(66, 140, 46, faceLight);
+          return pack24(66, 140, 46, faceLight);
         }
       }
 
@@ -129,28 +149,23 @@
       else if (n > 0.66) { r = 148; g = 102; b = 66; }
       else if (n > 0.30) { r = 128; g = 86; b = 54; }
       else { r = 104; g = 68; b = 42; }
-      return shadeColor(r, g, b, faceLight);
+      return pack24(r, g, b, faceLight);
     }
 
-    // ===== 木の幹（原木） =====
+    // ===== 木の幹 =====
     if (blockType === BLOCK_WOOD) {
       if (topFace) {
-        // 年輪パターン
-        const cx = Math.abs(lx - 3.5);
-        const cy = Math.abs(ly - 3.5);
-        const ring = Math.max(cx, cy);
-        if (ring >= 3.2) return shadeColor(98, 66, 40, faceLight); // 外皮
-        if (ring >= 2.0) return shadeColor(192, 152, 102, faceLight);
-        if (ring >= 1.0) return shadeColor(166, 126, 78, faceLight);
-        return shadeColor(142, 102, 60, faceLight);
+        const cx = Math.abs(lx - 2.5);
+        const cy = Math.abs(ly - 2.5);
+        const ring = cx > cy ? cx : cy;
+        if (ring >= 2.2) return pack24(98, 66, 40, faceLight);
+        if (ring >= 1.2) return pack24(192, 152, 102, faceLight);
+        return pack24(154, 114, 70, faceLight);
       }
-      // 側面の縦の樹皮スジ
       const barkStripe = hash3(lx + variantSeed * 3, ly + variantSeed * 5, 11);
-      let r, g, b;
-      if (barkStripe > 0.66) { r = 122; g = 84; b = 52; }
-      else if (barkStripe > 0.30) { r = 98; g = 66; b = 40; }
-      else { r = 74; g = 48; b = 28; }
-      return shadeColor(r, g, b, faceLight);
+      if (barkStripe > 0.66) return pack24(122, 84, 52, faceLight);
+      if (barkStripe > 0.30) return pack24(98, 66, 40, faceLight);
+      return pack24(74, 48, 28, faceLight);
     }
 
     // ===== 葉ブロック =====
@@ -160,31 +175,50 @@
       else if (n > 0.48) { r = 68; g = 146; b = 52; }
       else if (n > 0.18) { r = 46; g = 116; b = 42; }
       else { r = 32; g = 86; b = 34; }
-      return shadeColor(r, g, b, faceLight);
+      return pack24(r, g, b, faceLight);
     }
 
-    return [255, 0, 255];
+    // ===== 岩ブロック（岩山・崖・自然アーチ） =====
+    if (blockType === BLOCK_STONE) {
+      // 地層っぽいわずかな水平縞＋ごつごつした鉱物ノイズ
+      const strata = (lz === 2 || lz === 5) ? -10 : 0;
+      let r, g, b;
+      if (n > 0.88) { r = 166; g = 170; b = 176; } // 明るい石英粒
+      else if (n > 0.56) { r = 138; g = 142; b = 149; } // 標準岩肌
+      else if (n > 0.22) { r = 116; g = 121; b = 129; } // 影岩肌
+      else { r = 94; g = 99; b = 108; } // ひび割れ暗部
+      return pack24(r + strata, g + strata, b + strata, faceLight);
+    }
+
+    // ===== 深岩ブロック（崖の根元・トンネル内部・オーバーハング下部） =====
+    if (blockType === BLOCK_DARK_STONE) {
+      const strata = lz === 3 ? -8 : 0;
+      let r, g, b;
+      if (n > 0.86) { r = 114; g = 120; b = 132; }
+      else if (n > 0.50) { r = 90; g = 96; b = 108; }
+      else if (n > 0.18) { r = 72; g = 78; b = 90; }
+      else { r = 56; g = 62; b = 74; }
+      return pack24(r + strata, g + strata, b + strata, faceLight);
+    }
+
+    return 0xff00ff;
   }
 
   /**
-   * 64x64 ワールドの水面アニメーション用タイルテクスチャ（16フレーム, 256x256）を事前生成。
-   * 水面特有の網目模様（コースティクス）を作る「周期 Worley / Voronoi セルラーノイズ」を使用。
-   * - セル内部は透明度が高く水底がくっきり透ける
-   * - セル境界 (F2 - F1 ≈ 0) に細いアクア色の光の網目が浮かび、
-   *   特徴点が円軌道を描くことで空間(32px)も時間(16フレーム)も完全にシームレスに揺らぐ
+   * 128x128 ワールドの水面アニメーション用タイルテクスチャ（16フレーム, 512x512）を事前生成。
+   * 周期 Worley / Voronoi セルラーノイズ (F2 - F1) で、控えめで上品な水面の網目模様を描く。
    */
   function buildWaterAnimFrames(worldBlocksX, worldBlocksY) {
-    const pxPerBlock = 4; // 64 * 4 = 256px
+    const pxPerBlock = 4; // 128 * 4 = 512px
     const w = worldBlocksX * pxPerBlock;
     const h = worldBlocksY * pxPerBlock;
-    const tileSize = 32; // 8x8ブロック周期の大きなシームレスタイル
+    const tileSize = 32; // 8x8ブロック周期
     const halfTile = tileSize * 0.5;
     const frameCount = 16;
     const frames = [];
 
-    // 4x4 の層化ジッターグリッドで16個の特徴点を配置（ムラのない美しいセル構造）
     const gridN = 4;
-    const cellSpan = tileSize / gridN; // 8px
+    const cellSpan = tileSize / gridN;
     const basePoints = [];
     for (let gy = 0; gy < gridN; gy++) {
       for (let gx = 0; gx < gridN; gx++) {
@@ -208,7 +242,6 @@
     for (let f = 0; f < frameCount; f++) {
       const phase = (f / frameCount) * TWO_PI;
 
-      // 各特徴点を閉じた円軌道上で動かす（16フレームで完全に元の位置に戻る）
       for (let p = 0; p < basePoints.length; p++) {
         const bp = basePoints[p];
         const a = bp.phase0 + phase * bp.dir;
@@ -228,7 +261,6 @@
 
       for (let y = 0; y < tileSize; y++) {
         for (let x = 0; x < tileSize; x++) {
-          // トーラス周期距離で最近傍 d1 と 2番目 d2 を求める（Worley / Voronoi）
           let d1 = 9999;
           let d2 = 9999;
           for (let p = 0; p < basePoints.length; p++) {
@@ -245,19 +277,15 @@
             }
           }
 
-          // F2 - F1 が 0 に近いほど「水面の光の網目（コースティクス稜線）」
           const ridge = d2 - d1;
-          // 鋭い網目ライン (0..1)
           const web = Math.max(0, 1 - ridge / 1.65);
           const webSharp = web * web;
-          // セル中心は暗く透明、縁に近づくほどわずかに明るい水色
           const cellEdge = Math.min(1, d1 / 5.5);
 
-          // ベースは澄んだ透明水色（低アルファで底が見える）＋控えめで上品なアクア網目
-          let r = 22 + cellEdge * 20 + webSharp * 72;
-          let g = 130 + cellEdge * 26 + webSharp * 62;
-          let b = 198 + cellEdge * 18 + webSharp * 32;
-          let a = 48 + cellEdge * 22 + webSharp * 68;
+          const r = 22 + cellEdge * 20 + webSharp * 72;
+          const g = 130 + cellEdge * 26 + webSharp * 62;
+          const b = 198 + cellEdge * 18 + webSharp * 32;
+          const a = 48 + cellEdge * 22 + webSharp * 68;
 
           const idx = (y * tileSize + x) * 4;
           tImg.data[idx] = Math.min(255, Math.round(r));
@@ -297,11 +325,11 @@
 
       for (let ly = 0; ly < BLOCK_SIZE; ly++) {
         for (let lx = 0; lx < BLOCK_SIZE; lx++) {
-          const [r, g, b] = sampleBlockColor(blockType, lx, ly, lz, 3, isTop);
+          const rgb24 = sampleBlockColor24(blockType, lx, ly, lz, 3, isTop);
           const idx = (ly * BLOCK_SIZE + lx) * 4;
-          img.data[idx] = r;
-          img.data[idx + 1] = g;
-          img.data[idx + 2] = b;
+          img.data[idx] = (rgb24 >>> 16) & 255;
+          img.data[idx + 1] = (rgb24 >>> 8) & 255;
+          img.data[idx + 2] = rgb24 & 255;
           img.data[idx + 3] = 255;
         }
       }
@@ -319,9 +347,6 @@
     };
   }
 
-  /**
-   * プレビュー用の水ブロック（8段階の半透明スライス）
-   */
   function buildPreviewWaterModel() {
     const canvases = [];
     for (let lz = 0; lz < BLOCK_SLICES; lz++) {
@@ -336,16 +361,16 @@
         for (let lx = 0; lx < BLOCK_SIZE; lx++) {
           const idx = (ly * BLOCK_SIZE + lx) * 4;
           if (isTop) {
-            const crest = (lx + ly) % 4 === 0;
-            img.data[idx] = crest ? 158 : 78;
-            img.data[idx + 1] = crest ? 232 : 190;
-            img.data[idx + 2] = 252;
-            img.data[idx + 3] = crest ? 176 : 122;
+            const crest = (lx + ly) % 3 === 0;
+            img.data[idx] = crest ? 114 : 44;
+            img.data[idx + 1] = crest ? 214 : 158;
+            img.data[idx + 2] = crest ? 246 : 218;
+            img.data[idx + 3] = crest ? 138 : 76;
           } else {
             img.data[idx] = 10;
             img.data[idx + 1] = 92;
             img.data[idx + 2] = 174;
-            img.data[idx + 3] = 24;
+            img.data[idx + 3] = 22;
           }
         }
       }
@@ -368,14 +393,14 @@
   // ============================================================
   const PLAYER_PALETTE = {
     ".": null,
-    "b": "#3b2f2f", // ブーツ
-    "p": "#2d4c8a", // ズボン（青）
-    "P": "#223a6b", // ズボン影
-    "s": "#22b8cf", // シャツ（シアン）
-    "S": "#1592a6", // シャツ影
-    "k": "#f3c69f", // 肌
-    "h": "#4a2c18", // 髪（茶）
-    "e": "#111827", // 目
+    "b": "#3b2f2f",
+    "p": "#2d4c8a",
+    "P": "#223a6b",
+    "s": "#22b8cf",
+    "S": "#1592a6",
+    "k": "#f3c69f",
+    "h": "#4a2c18",
+    "e": "#111827",
   };
 
   function makePlayerSliceDefs(stepPose) {
@@ -514,7 +539,6 @@
       "........",
     ];
 
-    // 目は y=2 と y=5 に配置し、間に2pxの肌 (y=3, y=4) を挟んでしっかり離す
     const eyeRows = [
       "........",
       ".hhkk...",
@@ -548,20 +572,19 @@
       "........",
     ];
 
-    // 12スライス = 1.5ブロック高 (BLOCK_SLICES = 8)
     return [
-      bootRows, // z=0
-      legRows, // z=1
-      legRows, // z=2
-      hipRows, // z=3
-      handLowRows, // z=4
-      handLowRows, // z=5
-      torsoRows, // z=6
-      torsoRows, // z=7
-      chinRows, // z=8
-      eyeRows, // z=9
-      browRows, // z=10
-      hairRows, // z=11
+      bootRows,
+      legRows,
+      legRows,
+      hipRows,
+      handLowRows,
+      handLowRows,
+      torsoRows,
+      torsoRows,
+      chinRows,
+      eyeRows,
+      browRows,
+      hairRows,
     ];
   }
 
@@ -583,8 +606,8 @@
           const hex = PLAYER_PALETTE[rows[y][x]];
           if (!hex) continue;
           const num = parseInt(hex.slice(1), 16);
-          const [r, g, b] = shadeColor((num >> 16) & 255, (num >> 8) & 255, num & 255, shade);
-          ctx.fillStyle = `rgb(${r},${g},${b})`;
+          const abgr = shadeAndPackABGR((num >> 16) & 255, (num >> 8) & 255, num & 255, shade);
+          ctx.fillStyle = `rgb(${abgr & 255},${(abgr >>> 8) & 255},${(abgr >>> 16) & 255})`;
           ctx.fillRect(x, y, 1, 1);
         }
       }
@@ -602,9 +625,9 @@
 
   const previewModels = {
     grass: buildPreviewBlockModel(BLOCK_GRASS, "grass", "草ブロック"),
-    dirt: buildPreviewBlockModel(BLOCK_DIRT, "dirt", "土ブロック"),
+    stone: buildPreviewBlockModel(BLOCK_STONE, "stone", "岩ブロック"),
+    darkStone: buildPreviewBlockModel(BLOCK_DARK_STONE, "darkStone", "深岩ブロック"),
     wood: buildPreviewBlockModel(BLOCK_WOOD, "wood", "木の幹"),
-    leaves: buildPreviewBlockModel(BLOCK_LEAVES, "leaves", "葉ブロック"),
     water: buildPreviewWaterModel(),
     player: {
       id: "player",
@@ -624,10 +647,12 @@
   global.VoxelWalk.BLOCK_GRASS = BLOCK_GRASS;
   global.VoxelWalk.BLOCK_WOOD = BLOCK_WOOD;
   global.VoxelWalk.BLOCK_LEAVES = BLOCK_LEAVES;
+  global.VoxelWalk.BLOCK_STONE = BLOCK_STONE;
+  global.VoxelWalk.BLOCK_DARK_STONE = BLOCK_DARK_STONE;
   global.VoxelWalk.BLOCK_NAMES = BLOCK_NAMES;
   global.VoxelWalk.hash3 = hash3;
-  global.VoxelWalk.sampleBlockColor = sampleBlockColor;
-  global.VoxelWalk.shadeColor = shadeColor;
+  global.VoxelWalk.sampleBlockColor24 = sampleBlockColor24;
+  global.VoxelWalk.shadePacked24ToABGR = shadePacked24ToABGR;
   global.VoxelWalk.buildWaterAnimFrames = buildWaterAnimFrames;
   global.VoxelWalk.PLAYER_POSES = playerPoses;
   global.VoxelWalk.PREVIEW_MODELS = previewModels;

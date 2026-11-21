@@ -1,8 +1,8 @@
 /**
  * main.js
  * ------------------------------------------------------------
- * 64x64 ボクセルワールドのウォークスルー（歩行・ジャンプ・水中遊泳）、
- * テラリア式総量保存の水流ステップ実行、右側観察パネルのUI制御を行います。
+ * 128x128 マルチバイオーム・ボクセルワールドのウォークスルー制御、
+ * テラリア式水流ステップ実行、および FPS・ドローコール数などの描画統計表示を行います。
  */
 (function (global) {
   "use strict";
@@ -19,9 +19,6 @@
   let worldSeed = 104729;
   let world = createWorld(worldSeed);
 
-  // ============================================================
-  // 描画・観察設定
-  // ============================================================
   const settings = {
     sliceSpacingMult: 1.0,
     maxVisibleSlice: world.maxUsedSlice,
@@ -37,7 +34,7 @@
     z: world.spawnZ,
     yaw: Math.PI / 4,
     pitchDeg: 45,
-    zoom: 3.0,
+    zoom: 4.0,
     screenCenterX: 400,
     screenCenterY: 300,
   };
@@ -78,11 +75,22 @@
   const previewCanvas = document.getElementById("preview-canvas");
   const previewCtx = previewCanvas.getContext("2d");
 
+  const hudFps = document.getElementById("hud-fps");
   const hudPos = document.getElementById("hud-pos");
   const hudGround = document.getElementById("hud-ground");
-  const hudCam = document.getElementById("hud-cam");
+  const hudBiome = document.getElementById("hud-biome");
   const btnResetPos = document.getElementById("btn-reset-pos");
   const btnResetCam = document.getElementById("btn-reset-cam");
+
+  // 描画統計パネル要素
+  const statFps = document.getElementById("stat-fps");
+  const statRenderMs = document.getElementById("stat-render-ms");
+  const statDrawTotal = document.getElementById("stat-draw-total");
+  const statDrawBreak = document.getElementById("stat-draw-break");
+  const statSlices = document.getElementById("stat-slices");
+  const statCrop = document.getElementById("stat-crop");
+  const statWaterMs = document.getElementById("stat-water-ms");
+  const statWorldMeta = document.getElementById("stat-world-meta");
 
   const modelTabs = document.getElementById("model-tabs");
   const previewCaption = document.getElementById("preview-caption");
@@ -116,11 +124,12 @@
     valWaterTotal.textContent = `${cur} / ${init} (${status})`;
   }
 
-  function syncWorldSliderBounds() {
+  function syncWorldMeta() {
     sliderCutaway.max = String(world.maxUsedSlice);
     settings.maxVisibleSlice = world.maxUsedSlice;
     sliderCutaway.value = String(world.maxUsedSlice);
     valCutaway.textContent = `${world.maxUsedSlice} / ${world.maxUsedSlice}`;
+    statWorldMeta.textContent = `${world.sizeX}×${world.sizeY}×${world.sizeZ} (${world.solidBlockCount.toLocaleString()} blk / ベイク ${world.initialBakeMs.toFixed(0)}ms)`;
     updateWaterHud();
   }
 
@@ -175,7 +184,7 @@
   function resetCameraView() {
     camera.yaw = Math.PI / 4;
     camera.pitchDeg = 45;
-    camera.zoom = 3.0;
+    camera.zoom = 4.0;
     syncCameraUI();
   }
 
@@ -186,7 +195,7 @@
     }
     worldSeed = (worldSeed * 1103515245 + 12345) & 0x7fffffff;
     world = createWorld(worldSeed);
-    syncWorldSliderBounds();
+    syncWorldMeta();
     resetPlayerPosition();
   }
 
@@ -201,7 +210,6 @@
     valYaw.textContent = `${yawDeg}°`;
     sliderPitch.value = String(pitchDeg);
     valPitch.textContent = `${pitchDeg}°`;
-    hudCam.textContent = `${yawDeg}° / ${pitchDeg}°`;
 
     document.querySelectorAll("[data-pitch]").forEach((btn) => {
       const v = parseFloat(btn.dataset.pitch);
@@ -223,7 +231,6 @@
       syncCameraUI();
     }
 
-    // 足元の水深チェック
     const wFeet = world.getWaterLevelAt(player.x, player.y, player.z + 0.08);
     player.waterDepth = wFeet;
     player.inWater = wFeet > 0;
@@ -247,7 +254,7 @@
       const wx = ix * cos - iy * sin;
       const wy = ix * sin + iy * cos;
 
-      const walkSpeed = player.inWater ? 3.9 : 5.4;
+      const walkSpeed = player.inWater ? 4.2 : 6.0;
       const stepX = wx * walkSpeed * dt;
       const stepY = wy * walkSpeed * dt;
 
@@ -270,7 +277,6 @@
       player.walkCycle += dt;
     }
 
-    // ジャンプ（地上）または泳ぎ上がり（水中）
     if (keys["Space"]) {
       if (player.onGround) {
         player.vz = 7.6;
@@ -280,7 +286,6 @@
       }
     }
 
-    // 重力（水中では少し緩やか）
     const gravity = player.inWater ? 9.5 : 20.0;
     player.vz -= gravity * dt;
     if (player.inWater && player.vz < -2.6) {
@@ -334,8 +339,8 @@
     camera.y += (player.y - camera.y) * follow;
     camera.z += (player.z - camera.z) * Math.min(1, dt * 4.5);
 
-    // HUD 更新（固定幅・1行維持）
     hudPos.textContent = `${player.x.toFixed(1)}, ${player.y.toFixed(1)}, ${player.z.toFixed(1)}`;
+    hudBiome.textContent = world.getBiomeNameAt(player.x, player.y);
     const floor = world.findFloorBelow(player.x, player.y, player.z + 0.05);
     if (player.inWater) {
       hudGround.textContent = `水中 (${player.waterDepth}/8)`;
@@ -399,9 +404,10 @@
     const h = previewCanvas.height;
     previewCtx.clearRect(0, 0, w, h);
 
-    const scale = model.id === "player" ? 5.6 : 6.2;
+    const scale = model.id === "player" ? 5.6 : 7.8;
     const pitchRad = (camera.pitchDeg * Math.PI) / 180;
-    const totalLift = (model.layerCount - 1) * Math.cos(pitchRad) * scale * settings.sliceSpacingMult;
+    const unitScale = model.id === "player" ? 1.0 : 6 / 8;
+    const totalLift = (model.layerCount - 1) * Math.cos(pitchRad) * scale * unitScale * settings.sliceSpacingMult;
     const baseY = Math.min(h - 24, h / 2 + totalLift * 0.48 + 10);
 
     drawSingleModelPreview(previewCtx, model, {
@@ -454,7 +460,7 @@
         return;
       }
       setCutaway(current);
-    }, 50);
+    }, 45);
   }
 
   modelTabs.addEventListener("click", (ev) => {
@@ -501,8 +507,8 @@
     "wheel",
     (ev) => {
       ev.preventDefault();
-      const factor = ev.deltaY > 0 ? 0.91 : 1.10;
-      camera.zoom = Math.max(1.0, Math.min(6.5, camera.zoom * factor));
+      const factor = ev.deltaY > 0 ? 0.90 : 1.11;
+      camera.zoom = Math.max(0.8, Math.min(7.5, camera.zoom * factor));
     },
     { passive: false }
   );
@@ -580,28 +586,46 @@
   window.addEventListener("resize", resizeWorldCanvas);
 
   // ============================================================
-  // メインループ（水流シミュレーションは約 10Hz で実行）
+  // メインループ ＋ リアルタイム描画統計計測
   // ============================================================
   let lastTime = performance.now();
   let waterAccum = 0;
-  let hudWaterAccum = 0;
+  let lastWaterStepMs = 0;
+
+  let fpsFrames = 0;
+  let fpsWindowStart = performance.now();
+  let currentFps = 60;
+  let smoothRenderMs = 0;
+  let statsUiTimer = 0;
 
   function tick(now) {
-    const dt = Math.min(0.05, (now - lastTime) / 1000);
+    const rawDt = (now - lastTime) / 1000;
+    const dt = Math.min(0.05, Math.max(0.001, rawDt));
     lastTime = now;
+
+    // FPS 計測（0.25秒窓で滑らかに算出）
+    fpsFrames++;
+    const fpsElapsed = now - fpsWindowStart;
+    if (fpsElapsed >= 250) {
+      currentFps = (fpsFrames * 1000) / fpsElapsed;
+      fpsFrames = 0;
+      fpsWindowStart = now;
+    }
 
     updatePlayer(dt);
 
-    // テラリア式・内部64段階・スリープ付き水流ステップ実行
+    // 水流ステップ計測
     waterAccum += dt;
     if (waterAccum >= 0.085) {
       waterAccum = 0;
-      const moved = world.stepWater();
-      hudWaterAccum++;
-      if (moved || hudWaterAccum >= 8) {
-        hudWaterAccum = 0;
-        updateWaterHud();
+      if (world.isWaterSettled()) {
+        lastWaterStepMs = 0;
+      } else {
+        const wt0 = performance.now();
+        world.stepWater();
+        lastWaterStepMs = performance.now() - wt0;
       }
+      updateWaterHud();
     }
 
     const w = worldCanvas.width;
@@ -611,15 +635,34 @@
     camera.screenCenterX = w / 2;
     camera.screenCenterY = h / 2 + 12;
 
-    renderVoxelWorld(worldCtx, world, player, camera, settings, now * 0.001);
+    const rStats = renderVoxelWorld(worldCtx, world, player, camera, settings, now * 0.001);
+    smoothRenderMs = smoothRenderMs === 0 ? rStats.renderMs : smoothRenderMs * 0.85 + rStats.renderMs * 0.15;
+
     renderPreview(dt);
+
+    // 描画統計 UI を約 8Hz で更新（DOM負荷を抑えつつリアルタイム表示）
+    statsUiTimer += dt;
+    if (statsUiTimer >= 0.12) {
+      statsUiTimer = 0;
+      const fpsStr = `${currentFps.toFixed(1)} fps`;
+      hudFps.textContent = `${Math.round(currentFps)} fps`;
+      statFps.textContent = fpsStr;
+      statRenderMs.textContent = `${smoothRenderMs.toFixed(2)} ms`;
+      statDrawTotal.textContent = `${rStats.totalDrawCalls} calls`;
+      statDrawBreak.textContent = `地形 ${rStats.worldDrawCalls} / 水 ${rStats.waterDrawCalls} / 他 ${rStats.miscDrawCalls}`;
+      statSlices.textContent = `${rStats.drawnSlices} / ${rStats.totalSlices} (カリング ${rStats.culledSlices})`;
+      statCrop.textContent = `${Math.round(rStats.cropRatio * 100)}%`;
+      statWaterMs.textContent = world.isWaterSettled()
+        ? "0.00 ms (静止)"
+        : `${lastWaterStepMs.toFixed(2)} ms`;
+    }
 
     requestAnimationFrame(tick);
   }
 
   // 起動
   resizeWorldCanvas();
-  syncWorldSliderBounds();
+  syncWorldMeta();
   rebuildSliceGrid();
   syncCameraUI();
   resetPlayerPosition();

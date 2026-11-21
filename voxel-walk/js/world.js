@@ -1,14 +1,8 @@
 /**
  * world.js
  * ------------------------------------------------------------
- * 64x64x10 のノイズ起伏地形・ボクセルの木（幹＋葉）・
- * テラリア式の総量保存8段階水流シミュレーションを管理します。
- *
- * 【水シミュレーションの特徴】
- * - 各セルは整数 0..8 の水量を持つ（8 = 1ブロック満タン、1 = 1/8の浅い水たまり）
- * - 重力による落下＋隣接セルとの水平均等化＋崖フチの排水を行い、
- *   すべての移動が water[src] -= d; water[dst] += d のみで行われるため
- *   世界全体の水の総量（totalWater）が1単位も増減せず厳密に保存されます。
+ * 128x128x12 のマルチバイオーム（森の渓谷 ＋ 激しい岩山・オーバーハング・トンネル）と、
+ * テラリア式の総量保存・内部64段階/表示8段階・スリープ付き水流シミュレーションを管理します。
  */
 (function (global) {
   "use strict";
@@ -21,16 +15,17 @@
     BLOCK_GRASS,
     BLOCK_WOOD,
     BLOCK_LEAVES,
+    BLOCK_STONE,
+    BLOCK_DARK_STONE,
     hash3,
-    sampleBlockColor,
-    shadeColor,
+    sampleBlockColor24,
+    shadePacked24ToABGR,
   } = global.VoxelWalk;
 
-  const WORLD_X = 64;
-  const WORLD_Y = 64;
-  const WORLD_Z = 10; // 地形は z=0..5、木が z=6..9 まで伸びる
+  const WORLD_X = 128;
+  const WORLD_Y = 128;
+  const WORLD_Z = 12; // 97スライス (0..96) — 岩山が z=10 までそびえ、トンネルやオーバーハングが立体交差する
 
-  // テラリア式に内部水量を細かく保持（1ブロック = 64単位、表示は 8段階 = 8単位ごと）
   const WATER_PER_LEVEL = 8;
   const WATER_MAX = BLOCK_SLICES * WATER_PER_LEVEL; // 64
 
@@ -39,7 +34,11 @@
     return Math.min(BLOCK_SLICES, Math.ceil(units / WATER_PER_LEVEL));
   }
 
-  // スムーズな 2D 値ノイズ（多オクターブ FBM 用）
+  function smoothstep(edge0, edge1, x) {
+    const t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+    return t * t * (3 - 2 * t);
+  }
+
   function valueNoise2D(x, y, seed) {
     const ix = Math.floor(x);
     const iy = Math.floor(y);
@@ -64,13 +63,43 @@
     );
   }
 
+  function valueNoise3D(x, y, z, seed) {
+    const ix = Math.floor(x);
+    const iy = Math.floor(y);
+    const iz = Math.floor(z);
+    const fx = x - ix;
+    const fy = y - iy;
+    const fz = z - iz;
+    const ux = fx * fx * (3 - 2 * fx);
+    const uy = fy * fy * (3 - 2 * fy);
+    const uz = fz * fz * (3 - 2 * fz);
+
+    const n000 = hash3(ix, iy, iz + seed);
+    const n100 = hash3(ix + 1, iy, iz + seed);
+    const n010 = hash3(ix, iy + 1, iz + seed);
+    const n110 = hash3(ix + 1, iy + 1, iz + seed);
+    const n001 = hash3(ix, iy, iz + 1 + seed);
+    const n101 = hash3(ix + 1, iy, iz + 1 + seed);
+    const n011 = hash3(ix, iy + 1, iz + 1 + seed);
+    const n111 = hash3(ix + 1, iy + 1, iz + 1 + seed);
+
+    const x00 = n000 + (n100 - n000) * ux;
+    const x10 = n010 + (n110 - n010) * ux;
+    const x01 = n001 + (n101 - n001) * ux;
+    const x11 = n011 + (n111 - n011) * ux;
+    const y0 = x00 + (x10 - x00) * uy;
+    const y1 = x01 + (x11 - x01) * uy;
+    return y0 + (y1 - y0) * uz;
+  }
+
   function createWorld(seedInput) {
     const seed = seedInput !== undefined ? seedInput : 104729;
     const cellCount = WORLD_X * WORLD_Y * WORLD_Z;
     const blocks = new Uint8Array(cellCount);
-    const water = new Uint8Array(cellCount); // 各セルの水量 0..8
-    const falling = new Uint8Array(cellCount); // 滝として落下中フラグ
+    const water = new Uint8Array(cellCount);
+    const falling = new Uint8Array(cellCount);
     const surfaceHeight = new Uint8Array(WORLD_X * WORLD_Y);
+    const biomeMap = new Float32Array(WORLD_X * WORLD_Y); // 0 = 森の渓谷, 1 = 激しい岩山
 
     function index(x, y, z) {
       return (z * WORLD_Y + y) * WORLD_X + x;
@@ -91,66 +120,175 @@
     }
 
     // ============================================================
-    // 1. 多オクターブノイズで高低差のある 64x64 盆地地形を生成
+    // 1. 128x128 マルチバイオーム（森の渓谷 ＋ 激しい岩山・オーバーハング・トンネル）
     // ============================================================
     for (let y = 0; y < WORLD_Y; y++) {
       for (let x = 0; x < WORLD_X; x++) {
-        // 大きな起伏（山と谷）＋細かい起伏
-        const nBig = fbm2D(x * 0.055, y * 0.055, seed);
-        const nDetail = fbm2D(x * 0.13, y * 0.13, seed + 131);
+        // バイオーム判定：中央付近 (x > 66) が岩山バイオームに接するように軽くバイアス
+        const bNoise = fbm2D(x * 0.022, y * 0.022, seed + 503);
+        const eastBias = smoothstep(54, 78, x) * 0.24 - smoothstep(56, 36, x) * 0.16;
+        const rockiness = smoothstep(0.42, 0.62, bNoise + eastBias);
+        biomeMap[y * WORLD_X + x] = rockiness;
 
-        // 盆地の外縁 (マップ端付近) を少し高くして水が外へ逃げずに低い谷へ溜まるようにする
+        // 外周の盆地リム（水がマップ外へ漏れずに谷へ溜まるようにする）
         const nx = (x / (WORLD_X - 1)) * 2 - 1;
         const ny = (y / (WORLD_Y - 1)) * 2 - 1;
         const edgeDist = Math.max(Math.abs(nx), Math.abs(ny));
-        const rimBoost = edgeDist > 0.78 ? ((edgeDist - 0.78) / 0.22) * 2.4 : 0;
+        const rimBoost = edgeDist > 0.86 ? ((edgeDist - 0.86) / 0.14) * 3.0 : 0;
 
-        // 高低差をくっきり強調（低い谷は z=0..1、中腹は z=2..3、山頂は z=5）
-        const rawH = (nBig - 0.16) * 7.2 + (nDetail - 0.5) * 1.4 + rimBoost;
-        let topZ = Math.round(rawH);
-        topZ = Math.max(0, Math.min(5, topZ));
+        // --- 森・渓谷バイオームの基本高度 (z = 0..4) ---
+        const nForest = fbm2D(x * 0.036, y * 0.036, seed);
+        const nDetail = fbm2D(x * 0.11, y * 0.11, seed + 131);
+        const forestH = (nForest - 0.18) * 6.0 + (nDetail - 0.5) * 1.1;
 
-        // スタート地点付近 (32, 32) を歩きやすい中腹の高さ (z=2..3) に軽く整える
-        const distCenter = Math.hypot(x - 32, y - 32);
-        if (distCenter < 3.5) {
-          topZ = Math.max(2, Math.min(3, topZ));
+        // --- 岩山バイオームの険しい尾根 (リッジノイズで切り立った峰 z = 2..10) ---
+        const ridgeRaw = 1.0 - Math.abs(fbm2D(x * 0.042, y * 0.042, seed + 307) * 2 - 1);
+        const ridgeSharp = ridgeRaw * ridgeRaw;
+        const canyonRaw = fbm2D(x * 0.065, y * 0.065, seed + 613);
+        const rockH = 1.2 + ridgeSharp * 8.6 + (canyonRaw - 0.48) * 3.2;
+
+        let baseH = forestH * (1 - rockiness) + rockH * rockiness + rimBoost;
+
+        // スタート地点 (60, 64) 周辺は歩きやすい草原広場に整地
+        const distSpawn = Math.hypot(x - 60, y - 64);
+        if (distSpawn < 5.5) {
+          const blend = smoothstep(2.5, 5.5, distSpawn);
+          baseH = 2.0 * (1 - blend) + baseH * blend;
         }
 
-        surfaceHeight[y * WORLD_X + x] = topZ;
+        // スタートすぐ東側 (72..84, 56..70) に象徴的な岩山塊を盛り上げる（トンネル＆オーバーハング用）
+        const distLandmark = Math.hypot((x - 77) * 0.85, (y - 63) * 0.72);
+        const landmarkBoost = Math.max(0, 1 - distLandmark / 11.5) * 6.8;
+        if (landmarkBoost > 0.2) {
+          baseH = Math.max(baseH, 2.2 + landmarkBoost);
+          biomeMap[y * WORLD_X + x] = Math.max(rockiness, smoothstep(0.2, 2.0, landmarkBoost));
+        }
 
-        for (let z = 0; z <= topZ; z++) {
-          // 最も低い谷底 (topZ === 0) は土露出にして湖底らしさを演出
-          const isTop = z === topZ;
-          const isDirtShore = topZ === 0 && nDetail < 0.52;
-          setBlock(x, y, z, isTop && !isDirtShore ? BLOCK_GRASS : BLOCK_DIRT);
+        const localRock = biomeMap[y * WORLD_X + x];
+        let highestZ = 0;
+
+        // --- 3D密度評価によるオーバーハング＆トンネル生成 ---
+        for (let z = 0; z < WORLD_Z - 1; z++) {
+          let density = baseH - z;
+
+          // 激しい岩山バイオームでは 3D ノイズで張り出し(オーバーハング)＆えぐれ(アンダーカット)を加える
+          if (localRock > 0.25 && z >= 2 && z <= 9) {
+            const oh = valueNoise3D(x * 0.095, y * 0.095, z * 0.26, seed + 821) - 0.48;
+            // 上層(z>=5)は外へ張り出しやすく、中層(z=2..4)は内側へえぐれやすくして迫力あるオーバーハングを作る
+            const bias = z >= 5 ? 0.16 : -0.14;
+            density += (oh + bias) * 3.8 * localRock;
+          }
+
+          // 岩山内部にうねる3D洞窟・トンネルをくり抜く (z = 2..5)
+          if (localRock > 0.42 && z >= 2 && z <= 5 && distSpawn > 8) {
+            const tA = Math.abs(valueNoise3D(x * 0.065, y * 0.065, z * 0.12, seed + 1409) - 0.5);
+            const tB = Math.abs(valueNoise3D(x * 0.065 + 31, y * 0.065 + 17, z * 0.14, seed + 1801) - 0.5);
+            if (tA < 0.088 && tB < 0.125) {
+              density = -1.0;
+            }
+          }
+
+          if (z === 0) density = 1.0; // 最下層 z=0 は必ず床にする
+
+          if (density >= 0) {
+            // バイオームと高さに応じてブロック種類を決定
+            let type;
+            if (localRock > 0.52) {
+              // 岩山バイオーム：下部や地層帯に深岩、それ以外は岩ブロック
+              type = z <= 2 || z === 5 ? BLOCK_DARK_STONE : BLOCK_STONE;
+            } else if (localRock > 0.28 && z >= 4) {
+              type = BLOCK_STONE;
+            } else {
+              type = BLOCK_DIRT;
+            }
+            setBlock(x, y, z, type);
+            highestZ = z;
+          }
+        }
+
+        surfaceHeight[y * WORLD_X + x] = highestZ;
+      }
+    }
+
+    // 2. スタート地点東側のランドマーク岩山に「歩いて通り抜けられる大トンネル」と「張り出した大オーバーハング」を彫刻
+    //    - 東西貫通トンネル (x = 67..87, y = 62..64, z = 3..5 をくり抜き、z = 2 を岩床、z = 6..9 を岩屋根に)
+    for (let x = 66; x <= 88; x++) {
+      const curveY = 63 + Math.round(Math.sin((x - 66) * 0.22) * 1.4);
+      for (let dy = -1; dy <= 1; dy++) {
+        const ty = curveY + dy;
+        // しっかりした岩の床
+        setBlock(x, ty, 1, BLOCK_DARK_STONE);
+        setBlock(x, ty, 2, BLOCK_STONE);
+        // 高さ3ブロックの歩きやすいトンネル空間（天井は曲面のアーチ状に）
+        const roofClear = Math.abs(dy) === 0 ? 5 : 4;
+        for (let z = 3; z <= roofClear; z++) {
+          setBlock(x, ty, z, BLOCK_AIR);
         }
       }
     }
 
-    // スタート位置の安全座標を決定
-    const spawnX = 32.5;
-    const spawnY = 32.5;
-    const spawnZ = surfaceHeight[32 * WORLD_X + 32] + 1;
+    //    - トンネル北側に、空中に4ブロック大きくせり出す「迫力の大オーバーハング岩棚」(x = 71..79, y = 52..57)
+    for (let x = 71; x <= 79; x++) {
+      for (let y = 52; y <= 57; y++) {
+        // 下層 (z = 2..5) を大きくえぐって空洞にする
+        for (let z = 2; z <= 5; z++) {
+          setBlock(x, y, z, BLOCK_AIR);
+        }
+        // 上層 (z = 6..8) にせり出した岩のオーバーハングを作る
+        if (y >= 53 && y <= 57) {
+          setBlock(x, y, 6, BLOCK_DARK_STONE);
+          setBlock(x, y, 7, BLOCK_STONE);
+          if (y >= 54 && x >= 72 && x <= 78) {
+            setBlock(x, y, 8, BLOCK_STONE);
+          }
+        }
+      }
+    }
+
+    // 3. 露出している土ブロックの上面を草ブロックへ変換し、surfaceHeight と solidCount を確定
+    let solidBlockCount = 0;
+    for (let y = 0; y < WORLD_Y; y++) {
+      for (let x = 0; x < WORLD_X; x++) {
+        let topSolid = 0;
+        const localRock = biomeMap[y * WORLD_X + x];
+        for (let z = 0; z < WORLD_Z; z++) {
+          const b = getBlock(x, y, z);
+          if (b === BLOCK_AIR) continue;
+          topSolid = z;
+          if (b === BLOCK_DIRT && getBlock(x, y, z + 1) === BLOCK_AIR && localRock < 0.45 && z >= 1) {
+            setBlock(x, y, z, BLOCK_GRASS);
+          }
+          solidBlockCount++;
+        }
+        surfaceHeight[y * WORLD_X + x] = topSolid;
+      }
+    }
+
+    // スタート地点の安全座標
+    const spawnX = 60.5;
+    const spawnY = 64.5;
+    const spawnZ = surfaceHeight[64 * WORLD_X + 60] + 1;
 
     // ============================================================
-    // 2. ボクセルの木（幹＋葉の樹冠）を草原の丘や中腹に生やす
+    // 4. 森の渓谷バイオームにボクセルの木を生やす
     // ============================================================
     const treePositions = [];
     for (let y = 4; y < WORLD_Y - 4; y += 2) {
       for (let x = 4; x < WORLD_X - 4; x += 2) {
+        if (biomeMap[y * WORLD_X + x] > 0.36) continue; // 岩山には生やさない
         const topZ = surfaceHeight[y * WORLD_X + x];
-        // 谷底（池になる場所）やスタート地点直上は避ける
-        if (topZ < 2 || topZ > 4) continue;
-        if (Math.hypot(x - 32, y - 32) < 4.5) continue;
+        if (topZ < 2 || topZ > 5) continue;
+        if (Math.hypot(x - 60, y - 64) < 5.5) continue;
         if (getBlock(x, y, topZ) !== BLOCK_GRASS) continue;
+        if (getBlock(x, y, topZ + 1) !== BLOCK_AIR) continue;
 
         const r = hash3(x, y, seed + 777);
-        if (r < 0.905) continue;
+        if (r < 0.915) continue;
 
-        // 他の木と近すぎないように間隔を空ける
         let tooClose = false;
-        for (const tp of treePositions) {
-          if (Math.hypot(x - tp.x, y - tp.y) < 4.6) {
+        for (let k = Math.max(0, treePositions.length - 40); k < treePositions.length; k++) {
+          const tp = treePositions[k];
+          if (Math.hypot(x - tp.x, y - tp.y) < 5.0) {
             tooClose = true;
             break;
           }
@@ -162,31 +300,34 @@
 
         treePositions.push({ x, y, topZ, trunkH });
 
-        // 幹 (BLOCK_WOOD)
         for (let dz = 1; dz <= trunkH; dz++) {
           setBlock(x, y, topZ + dz, BLOCK_WOOD);
+          solidBlockCount++;
         }
 
-        // 葉の樹冠 (3x3 の下段 ＋ 角を落とした上段)
         const canopyZ = topZ + trunkH;
         for (let dy = -1; dy <= 1; dy++) {
           for (let dx = -1; dx <= 1; dx++) {
-            // 下段: 幹の頂点の周囲 3x3（四隅をランダムに丸める）
             const isCorner = Math.abs(dx) === 1 && Math.abs(dy) === 1;
             if (!(isCorner && hash3(x + dx, y + dy, canopyZ) > 0.65)) {
               if (getBlock(x + dx, y + dy, canopyZ) === BLOCK_AIR) {
                 setBlock(x + dx, y + dy, canopyZ, BLOCK_LEAVES);
+                solidBlockCount++;
               }
             }
-            // 中段: 3x3 全面
             if (canopyZ + 1 < WORLD_Z) {
               if (!isCorner || hash3(x + dx, y + dy, canopyZ + 1) < 0.72) {
-                setBlock(x + dx, y + dy, canopyZ + 1, BLOCK_LEAVES);
+                if (getBlock(x + dx, y + dy, canopyZ + 1) === BLOCK_AIR) {
+                  setBlock(x + dx, y + dy, canopyZ + 1, BLOCK_LEAVES);
+                  solidBlockCount++;
+                }
               }
             }
-            // 頂上: 十字 (+) の5ブロック
             if (canopyZ + 2 < WORLD_Z && Math.abs(dx) + Math.abs(dy) <= 1) {
-              setBlock(x + dx, y + dy, canopyZ + 2, BLOCK_LEAVES);
+              if (getBlock(x + dx, y + dy, canopyZ + 2) === BLOCK_AIR) {
+                setBlock(x + dx, y + dy, canopyZ + 2, BLOCK_LEAVES);
+                solidBlockCount++;
+              }
             }
           }
         }
@@ -194,14 +335,14 @@
     }
 
     // ============================================================
-    // 3. 高速 3D AO ＋ 段差エッジ強調 ＋ 境界天面キャップ スライスベイク
+    // 5. 高速ゼロアロケーション 3D AO ＋ 段差エッジ ＋ 境界天面キャップベイク
     // ============================================================
     const totalSlices = WORLD_Z * BLOCK_SLICES + 1;
-    const canvasW = WORLD_X * BLOCK_SIZE;
-    const canvasH = WORLD_Y * BLOCK_SIZE;
+    const canvasW = WORLD_X * BLOCK_SIZE; // 768
+    const canvasH = WORLD_Y * BLOCK_SIZE; // 768
     const sliceCache = Object.create(null);
 
-    // 上空遮蔽キャッシュ（各 (x, y, z) の直上に屋根ブロックがある距離）
+    // 上空遮蔽テーブル（トンネル内部やオーバーハング下に深い影を落とす）
     const roofDistTable = new Uint8Array(cellCount);
     for (let y = 0; y < WORLD_Y; y++) {
       for (let x = 0; x < WORLD_X; x++) {
@@ -223,10 +364,20 @@
       return roofDistTable[index(x, y, z)];
     }
 
-    // 32bit リトルエンディアン ABGR パック（高速書き込み）
     function packRGBA(r, g, b, a) {
       return ((a & 255) << 24) | ((b & 255) << 16) | ((g & 255) << 8) | (r & 255);
     }
+
+    // 地中埋没ブロック用の高速単色カラー
+    const BURIED_COLORS = new Uint32Array(8);
+    BURIED_COLORS[BLOCK_DIRT] = packRGBA(74, 50, 32, 255);
+    BURIED_COLORS[BLOCK_GRASS] = packRGBA(74, 50, 32, 255);
+    BURIED_COLORS[BLOCK_STONE] = packRGBA(82, 86, 94, 255);
+    BURIED_COLORS[BLOCK_DARK_STONE] = packRGBA(52, 56, 66, 255);
+    BURIED_COLORS[BLOCK_WOOD] = packRGBA(76, 52, 32, 255);
+    BURIED_COLORS[BLOCK_LEAVES] = packRGBA(36, 90, 36, 255);
+
+    const bakeStartMs = performance.now();
 
     function bakeSlices(enableAO, enableEdge) {
       const slices = [];
@@ -243,7 +394,7 @@
           overhang: getBlock(ox, oy, bz + 1) !== BLOCK_AIR,
           cornerNeg: getBlock(ox - tx, oy - ty, bz) !== BLOCK_AIR,
           cornerPos: getBlock(ox + tx, oy + ty, bz) !== BLOCK_AIR,
-          skyFactor: roofDist > 0 ? Math.min(0.76, 0.60 + roofDist * 0.03) : 1.0,
+          skyFactor: roofDist > 0 ? Math.min(0.76, 0.54 + roofDist * 0.03) : 1.0,
         };
       }
 
@@ -252,6 +403,25 @@
         const lz = sliceZ % BLOCK_SLICES;
         const isBoundaryPlane = lz === 0 && bz > 0;
 
+        // まずこのスライスに1ブロックでも描く対象があるか事前チェック（空スライスのCanvas生成を回避）
+        let anyInSlice = false;
+        for (let by = 0; by < WORLD_Y && !anyInSlice; by++) {
+          for (let bx = 0; bx < WORLD_X; bx++) {
+            if (bz < WORLD_Z && blocks[index(bx, by, bz)] !== BLOCK_AIR) {
+              anyInSlice = true;
+              break;
+            }
+            if (isBoundaryPlane && blocks[index(bx, by, bz - 1)] !== BLOCK_AIR) {
+              anyInSlice = true;
+              break;
+            }
+          }
+        }
+        if (!anyInSlice) {
+          slices.push(null);
+          continue;
+        }
+
         const c = document.createElement("canvas");
         c.width = canvasW;
         c.height = canvasH;
@@ -259,19 +429,17 @@
         const img = ctx.createImageData(canvasW, canvasH);
         const buf32 = new Uint32Array(img.data.buffer);
 
-        let hasAnyPixel = false;
-
         for (let by = 0; by < WORLD_Y; by++) {
           const basePy = by * BLOCK_SIZE;
           for (let bx = 0; bx < WORLD_X; bx++) {
-            let type = bz < WORLD_Z ? getBlock(bx, by, bz) : BLOCK_AIR;
+            let type = bz < WORLD_Z ? blocks[index(bx, by, bz)] : BLOCK_AIR;
             let drawBz = bz;
             let drawLz = lz;
             let isTopCap = false;
 
             if (type === BLOCK_AIR) {
               if (isBoundaryPlane) {
-                const belowType = getBlock(bx, by, bz - 1);
+                const belowType = blocks[index(bx, by, bz - 1)];
                 if (belowType !== BLOCK_AIR) {
                   type = belowType;
                   drawBz = bz - 1;
@@ -281,20 +449,19 @@
               }
               if (type === BLOCK_AIR) continue;
             }
-            hasAnyPixel = true;
 
             const basePx = bx * BLOCK_SIZE;
 
-            // 高速パス：完全に地中に埋まっている側面スライスは単色土で高速塗りつぶし
+            // 高速パス：四方が完全に埋まった地中側面ブロックは単色パック書き込み
             if (
               !isTopCap &&
-              type === BLOCK_DIRT &&
-              getBlock(bx - 1, by, drawBz) !== BLOCK_AIR &&
-              getBlock(bx + 1, by, drawBz) !== BLOCK_AIR &&
-              getBlock(bx, by - 1, drawBz) !== BLOCK_AIR &&
-              getBlock(bx, by + 1, drawBz) !== BLOCK_AIR
+              bx > 0 && bx < WORLD_X - 1 && by > 0 && by < WORLD_Y - 1 &&
+              blocks[index(bx - 1, by, drawBz)] !== BLOCK_AIR &&
+              blocks[index(bx + 1, by, drawBz)] !== BLOCK_AIR &&
+              blocks[index(bx, by - 1, drawBz)] !== BLOCK_AIR &&
+              blocks[index(bx, by + 1, drawBz)] !== BLOCK_AIR
             ) {
-              const packed = packRGBA(76, 52, 34, 255);
+              const packed = BURIED_COLORS[type] || BURIED_COLORS[BLOCK_STONE];
               for (let ly = 0; ly < BLOCK_SIZE; ly++) {
                 const rowOff = (basePy + ly) * canvasW + basePx;
                 for (let lx = 0; lx < BLOCK_SIZE; lx++) {
@@ -304,8 +471,7 @@
               continue;
             }
 
-            // 標高明暗グラデーション（木の上の葉が白飛びしないよう緩やかにクランプ）
-            const elevLight = enableEdge ? Math.min(1.24, 0.80 + drawBz * 0.08) : 1.0;
+            const elevLight = enableEdge ? Math.min(1.26, 0.78 + drawBz * 0.062) : 1.0;
 
             let aoN = false, aoS = false, aoW = false, aoE = false;
             let aoNW = false, aoNE = false, aoSW = false, aoSE = false;
@@ -340,15 +506,15 @@
 
                 const roofDist = skyRoofDistance(bx, by, drawBz);
                 if (roofDist > 0) {
-                  // 木の樹冠や橋の真下に柔らかな木陰・屋根影を落とす
-                  topSkyFactor = Math.min(0.72, 0.56 + roofDist * 0.03);
+                  // トンネル内部や大オーバーハング下にしっかり濃い影を落とす
+                  topSkyFactor = Math.min(0.68, 0.44 + roofDist * 0.035);
                 } else {
                   let nearRoof = 0;
                   if (skyRoofDistance(bx - 1, by, drawBz) > 0) nearRoof++;
                   if (skyRoofDistance(bx + 1, by, drawBz) > 0) nearRoof++;
                   if (skyRoofDistance(bx, by - 1, drawBz) > 0) nearRoof++;
                   if (skyRoofDistance(bx, by + 1, drawBz) > 0) nearRoof++;
-                  if (nearRoof > 0) topSkyFactor = 1.0 - nearRoof * 0.045;
+                  if (nearRoof > 0) topSkyFactor = 1.0 - nearRoof * 0.05;
                 }
               } else {
                 sideN = getSideAOInfo(bx, by, drawBz, 0, -1);
@@ -363,7 +529,7 @@
             for (let ly = 0; ly < BLOCK_SIZE; ly++) {
               const rowOff = (basePy + ly) * canvasW + basePx;
               for (let lx = 0; lx < BLOCK_SIZE; lx++) {
-                let [r, g, b] = sampleBlockColor(type, lx, ly, drawLz, variant, isTopCap);
+                const rgb24 = sampleBlockColor24(type, lx, ly, drawLz, variant, isTopCap);
                 let lightMult = elevLight;
 
                 if (enableAO) {
@@ -384,7 +550,7 @@
                     const calcFaceAO = (info, tCoord) => {
                       let f = info.skyFactor;
                       if (info.floorCrease && drawLz <= 2) f *= 0.56 + drawLz * 0.15;
-                      if (info.overhang && drawLz >= BLOCK_SLICES - 3) f *= 0.54 + (BLOCK_SLICES - 1 - drawLz) * 0.15;
+                      if (info.overhang && drawLz >= BLOCK_SLICES - 3) f *= 0.52 + (BLOCK_SLICES - 1 - drawLz) * 0.15;
                       if (info.cornerNeg && tCoord <= 1) f *= 0.60 + tCoord * 0.18;
                       if (info.cornerPos && tCoord >= BLOCK_SIZE - 2) f *= 0.60 + (BLOCK_SIZE - 1 - tCoord) * 0.18;
                       return f;
@@ -399,7 +565,6 @@
                   lightMult *= Math.max(0.28, ao);
                 }
 
-                // 段差エッジ強調（1px 暗い輪郭線 ＋ 内側 1px 明るいベベル）
                 if (enableEdge && isTopCap) {
                   const isOuter =
                     (dropN && ly === 0) ||
@@ -423,24 +588,18 @@
                       (dropNE && lx >= BLOCK_SIZE - 2 && ly <= 1) ||
                       (dropSW && lx <= 1 && ly >= BLOCK_SIZE - 2) ||
                       (dropSE && lx >= BLOCK_SIZE - 2 && ly >= BLOCK_SIZE - 2);
-                    if (isBevel) lightMult *= 1.16;
+                    if (isBevel) lightMult *= 1.15;
                   }
                 }
 
-                if (Math.abs(lightMult - 1.0) > 0.002) {
-                  [r, g, b] = shadeColor(r, g, b, Math.max(0.25, lightMult));
-                }
-
-                buf32[rowOff + lx] = packRGBA(r, g, b, 255);
+                buf32[rowOff + lx] = shadePacked24ToABGR(rgb24, Math.max(0.24, lightMult));
               }
             }
           }
         }
 
-        if (hasAnyPixel) {
-          ctx.putImageData(img, 0, 0);
-        }
-        slices.push(hasAnyPixel ? c : null);
+        ctx.putImageData(img, 0, 0);
+        slices.push(c);
       }
 
       return slices;
@@ -455,6 +614,7 @@
     }
 
     const defaultSlices = getSlices(true, true);
+    const initialBakeMs = performance.now() - bakeStartMs;
 
     let maxUsedSlice = 0;
     for (let s = totalSlices - 1; s >= 0; s--) {
@@ -465,10 +625,8 @@
     }
 
     // ============================================================
-    // 4. テラリア式・内部64段階 / 表示8段階・動的落ち口BFS・スリープ付き水流
+    // 6. テラリア式・内部64段階 / 表示8段階・動的落ち口BFS・スリープ付き水流
     // ============================================================
-    // 各高さ z で「現在まだ満水でない (water < WATER_MAX) 落ち口」までの最短距離を動的 BFS で計算。
-    // 下の池が満水になると落ち口が消えて distToDrop=255 になるため、岸辺での往復振動が起きない。
     const distToDrop = new Uint8Array(cellCount);
     distToDrop.fill(255);
     const bfsQueue = new Int32Array(WORLD_X * WORLD_Y);
@@ -481,7 +639,6 @@
         let qHead = 0;
         let qTail = 0;
 
-        // 直下 (z - 1) が非固体 かつ まだ満水でない (water < WATER_MAX) セルだけを有効落ち口(距離0)にする
         for (let y = 0; y < WORLD_Y; y++) {
           for (let x = 0; x < WORLD_X; x++) {
             const i = index(x, y, z);
@@ -589,24 +746,19 @@
         for (let y = 0; y < WORLD_Y; y++) {
           const rowOff = y * WORLD_X;
           for (let x = 0; x < WORLD_X; x++) {
-            // 1. 水の体積スライス（内部水量 0..64 を表示 8段階 0..8 へ変換）
             if (bz < WORLD_Z) {
               const idx = index(x, y, bz);
               const visLevel = waterToVisualLevel(water[idx]);
               if (visLevel >= lz + 1) {
                 hasBody = 1;
                 if (falling[idx]) {
-                  // 滝（落下中）は泡を含んで少し見えるシアン
                   bBuf[rowOff + x] = packRGBA(82, 198, 240, 64);
                 } else {
-                  // 水の内部はほぼ透明（1層あたり約8%の深い青）にしてフォグ感をなくし、
-                  // 深い場所だけ自然な重なりで澄んだ濃い青になるようにする
                   bBuf[rowOff + x] = packRGBA(10, 92, 174, 20);
                 }
               }
             }
 
-            // 2. 露出水面キャップ（表示深さ visLevel の頂上スライスに水面波紋を描く）
             if (lz > 0 && bz < WORLD_Z) {
               const visLevel = waterToVisualLevel(water[index(x, y, bz)]);
               if (visLevel === lz) {
@@ -636,9 +788,6 @@
     let waterSettled = false;
     let calmStreak = 0;
 
-    /**
-     * 山頂・高所の複数の水源に一定量の水をまとめて配置する（常に一定の総量でスタート）
-     */
     function resetWaterToHighlands() {
       water.fill(0);
       falling.fill(0);
@@ -647,27 +796,41 @@
       waterSettled = false;
       calmStreak = 0;
 
+      // 岩山の上や高台（ランドマークのオーバーハング付近含む）から水を流し落とす
       const highSpots = [];
-      for (let y = 3; y < WORLD_Y - 3; y++) {
-        for (let x = 3; x < WORLD_X - 3; x++) {
+      for (let y = 4; y < WORLD_Y - 4; y += 2) {
+        for (let x = 4; x < WORLD_X - 4; x += 2) {
           const topZ = surfaceHeight[y * WORLD_X + x];
-          if (topZ >= 4 && getBlock(x, y, topZ + 1) === BLOCK_AIR) {
+          if (topZ >= 4 && topZ + 1 < WORLD_Z && getBlock(x, y, topZ + 1) === BLOCK_AIR) {
             highSpots.push({ x, y, z: topZ + 1 });
           }
         }
       }
 
-      // 目標の総水量（内部64単位 × 425ブロック相当 = 27200単位）
-      const targetUnits = 3400 * WATER_PER_LEVEL;
+      const targetUnits = 7200 * WATER_PER_LEVEL; // 57,600 単位 (900ブロック相当)
       let placed = 0;
 
+      // まずランドマーク岩山（大オーバーハング付近）に滝の水源を少し配置
+      for (let x = 73; x <= 77 && placed < targetUnits; x++) {
+        for (let y = 54; y <= 57 && placed < targetUnits; y++) {
+          const z = surfaceHeight[y * WORLD_X + x] + 1;
+          if (z < WORLD_Z && getBlock(x, y, z) === BLOCK_AIR) {
+            const i = index(x, y, z);
+            const add = Math.min(WATER_MAX - water[i], 48);
+            water[i] += add;
+            layerHasWater[z] = 1;
+            placed += add;
+          }
+        }
+      }
+
       if (highSpots.length > 0) {
-        const stride = Math.max(1, Math.floor(highSpots.length / 420));
+        const stride = Math.max(1, Math.floor(highSpots.length / 750));
         let pass = 0;
-        while (placed < targetUnits && pass < 16) {
+        while (placed < targetUnits && pass < 20) {
           for (let k = 0; k < highSpots.length && placed < targetUnits; k += stride) {
-            const sp = highSpots[(k + pass * 7) % highSpots.length];
-            const z = Math.min(WORLD_Z - 1, sp.z + Math.floor(pass / 4));
+            const sp = highSpots[(k + pass * 11) % highSpots.length];
+            const z = Math.min(WORLD_Z - 1, sp.z + Math.floor(pass / 5));
             const i = index(sp.x, sp.y, z);
             if (blocks[i] === BLOCK_AIR && water[i] < WATER_MAX) {
               const add = Math.min(WATER_MAX - water[i], targetUnits - placed, 32);
@@ -677,23 +840,6 @@
             }
           }
           pass++;
-        }
-      }
-
-      if (placed < targetUnits) {
-        for (let y = 4; y < WORLD_Y - 4 && placed < targetUnits; y += 2) {
-          for (let x = 4; x < WORLD_X - 4 && placed < targetUnits; x += 2) {
-            const z = surfaceHeight[y * WORLD_X + x] + 1;
-            if (z < WORLD_Z) {
-              const i = index(x, y, z);
-              if (blocks[i] === BLOCK_AIR && water[i] < WATER_MAX) {
-                const add = Math.min(WATER_MAX - water[i], targetUnits - placed);
-                water[i] += add;
-                layerHasWater[z] = 1;
-                placed += add;
-              }
-            }
-          }
         }
       }
 
@@ -710,16 +856,12 @@
     ];
     let simTick = 0;
 
-    /**
-     * 水シミュレーションを1ステップ進める（内部64段階・厳密総量保存・動的落ち口BFS・スリープ対応）
-     */
     function stepWater() {
       if (waterSettled) return false;
       simTick++;
       falling.fill(0);
 
-      // 3ステップごとに「まだ満水でない有効落ち口」BFSを再計算（満水になった池の岸での往復を完全防止）
-      if (simTick % 3 === 1) {
+      if (simTick % 4 === 1) {
         recomputeActiveDrops();
       }
 
@@ -752,7 +894,7 @@
         }
       }
 
-      // --- Pass 1: 重力落下（下から上へ走査し、空いている下のセルへ一気に落ちる） ---
+      // Pass 1: 重力落下
       for (let z = 1; z < WORLD_Z; z++) {
         if (!layerHasWater[z]) continue;
         for (let y = yStart; y !== yEnd; y += yStep) {
@@ -774,7 +916,7 @@
         }
       }
 
-      // --- Pass 2: 後戻りしない下り排水（高所） ＋ 滑らかな湖面均等化（低所） ---
+      // Pass 2: 単調下り排水 ＋ 湖面均等化
       const dirStart = simTick & 3;
       const downhillBuf = [0, 0, 0, 0];
       const basinBuf = [0, 0, 0, 0];
@@ -790,7 +932,6 @@
             if (w === 0) continue;
             anyInLayer = 1;
 
-            // 下にまだ空きがある（落下途中）なら水平拡散しない
             if (z > 0) {
               const below = index(x, y, z - 1);
               if (blocks[below] === BLOCK_AIR && water[below] < WATER_MAX) {
@@ -801,8 +942,6 @@
 
             const curDist = distToDrop[i];
 
-            // A) 有効な未満水落ち口へ到達可能なセル (0 < curDist < 255):
-            //    厳密に distToDrop が小さくなる方向だけへ流す（単調減少＝往復振動が数学的に不可能！）
             if (curDist > 0 && curDist < 255) {
               let bestDist = curDist;
               let bestCount = 0;
@@ -834,7 +973,6 @@
                     : Math.floor(hash3(x + simTick * 5, y + simTick * 3, z) * bestCount);
                 const dst = downhillBuf[pick];
                 const room = WATER_MAX - water[dst];
-                // 薄い残水 (<= 10) は一塊で下り方向へ押し出して高所を完全に乾かす
                 const want = w <= 10 ? w : Math.max(4, Math.ceil(w * 0.55));
                 const flow = Math.min(w, room, want);
                 if (flow > 0) {
@@ -844,8 +982,6 @@
               }
             }
 
-            // B) 安定した池・くぼみ内の水平均等化（差が3以上のときだけ素早く均等化 → 収束して完全静止）
-            //    ※ 排水路の途中 (0 < curDist < 255) からは上流 (dist > curDist) へ絶対に押し戻さない
             let bCount = 0;
             for (let d = 0; d < 4; d++) {
               const dir = DIRS[(dirStart + d) & 3];
@@ -887,10 +1023,9 @@
         rebuildDirtyWaterSlices();
       }
 
-      // テラリア式スリープ判定：見た目の変化も十分な移動もなくなったら完全静止にする
       if (totalMoved === 0) {
         calmStreak += 3;
-      } else if (!visualChanged && totalMoved <= 6) {
+      } else if (!visualChanged && totalMoved <= 12) {
         calmStreak++;
       } else {
         calmStreak = 0;
@@ -898,7 +1033,6 @@
 
       if (calmStreak >= 12) {
         waterSettled = true;
-        // 滝フラグをクリアして静止水色に確定
         falling.fill(0);
         dirtyWaterSlices.fill(1);
         rebuildDirtyWaterSlices();
@@ -921,6 +1055,12 @@
       const bz = Math.floor(wz);
       if (!inBounds(bx, by, bz)) return 0;
       return waterToVisualLevel(water[index(bx, by, bz)]);
+    }
+
+    function getBiomeNameAt(wx, wy) {
+      const bx = Math.max(0, Math.min(WORLD_X - 1, Math.floor(wx)));
+      const by = Math.max(0, Math.min(WORLD_Y - 1, Math.floor(wy)));
+      return biomeMap[by * WORLD_X + bx] > 0.45 ? "岩山・峡谷" : "森の渓谷";
     }
 
     function findFloorBelow(wx, wy, fromZ) {
@@ -951,12 +1091,14 @@
       spawnY,
       spawnZ,
       treeCount: treePositions.length,
+      solidBlockCount,
+      initialBakeMs,
       getBlock,
       setBlock,
       inBounds,
       findFloorBelow,
+      getBiomeNameAt,
       getSlices,
-      // 水関連API
       waterBodySlices,
       waterSurfaceMasks,
       waterSliceHasBody,
