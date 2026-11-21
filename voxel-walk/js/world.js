@@ -107,6 +107,11 @@
     const blocks = new Uint8Array(cellCount);
     const water = new Uint8Array(cellCount);
     const falling = new Uint8Array(cellCount);
+    const streamWet = new Uint8Array(cellCount);  // 流れる小川が途切れず繋がるための残像タイマー
+    const streamFall = new Uint8Array(cellCount); // 段差を落ちる滝・小川カーテンの残像タイマー
+    const trailActive = new Uint8Array(cellCount);
+    const trailList = new Int32Array(cellCount);
+    let trailCount = 0;
     const torches = new Uint8Array(cellCount); // 1 = 松明が置かれている（明るさ15）
     const foliage = new Uint8Array(cellCount); // 0=なし, 1=短い雑草, 2=背の高い雑草, 3=花
     const skyLight = new Uint8Array(cellCount); // 0..15（太陽光）
@@ -355,7 +360,7 @@
     setBlock(75, 52, 8, BLOCK_DARK_STONE);
     setBlock(75, 52, 9, BLOCK_STONE);
     for (let cz = 10; cz < WORLD_Z; cz++) setBlock(75, 52, cz, BLOCK_AIR);
-    springs.push({ x: 75, y: 55, z: 10, basinZ: 9, rate: 5, interval: 2 });
+    springs.push({ x: 75, y: 55, z: 10, basinZ: 9, rate: 3, interval: 1 });
 
     // ② さらにマップ各地の高い山・高台に 4〜5か所の山の泉（くぼんだ池＋湧出）を自動配置
     const peakCandidates = [];
@@ -445,7 +450,7 @@
           }
         }
       }
-      springs.push({ x: sx, y: sy, z: sz, basinZ: sz - 1, rate: 4, interval: 3 });
+      springs.push({ x: sx, y: sy, z: sz, basinZ: sz - 1, rate: 2, interval: 1 });
       extraPlaced++;
     }
 
@@ -1362,17 +1367,46 @@
 
     function rebuildDirtyWaterSlices() {
       let anyUpdated = false;
+      const layerStride = WORLD_X * WORLD_Y;
       for (let bz = 0; bz < WORLD_Z; bz++) {
         if (!dirtyWaterLayers[bz]) continue;
         const out = waterLayerBytes[bz];
-        const baseIdx = bz * WORLD_Y * WORLD_X;
-        for (let p = 0; p < WORLD_X * WORLD_Y; p++) {
+        const baseIdx = bz * layerStride;
+        for (let p = 0; p < layerStride; p++) {
           const idx = baseIdx + p;
-          const visLevel = waterToVisualLevel(water[idx]);
-          // Gチャンネルフラグ: bit0=滝落下, bit1=固体, bit2=溶岩, bit3=松明, bit4=木(幹/葉), bit5=葉, bit6-7=草花(1=短草,2=高草,3=花)
           const b = blocks[idx];
+          let visLevel = waterToVisualLevel(water[idx]);
+          let isFall = 0;
+
+          if (b === BLOCK_AIR) {
+            const hasFall = falling[idx] !== 0 || streamFall[idx] > 0;
+            if (hasFall) {
+              isFall = 1;
+              // 真上も落下中なら8スライス満タンの滝カーテン、落ち口（段差の上端）なら小川と同じ高さ2で滑らかに接続！
+              const aboveFalling =
+                bz + 1 < WORLD_Z &&
+                (falling[idx + layerStride] !== 0 || streamFall[idx + layerStride] > 0);
+              if (aboveFalling) {
+                visLevel = Math.max(visLevel, 8);
+              } else {
+                visLevel = Math.max(visLevel, 2);
+              }
+            } else if (streamWet[idx] > 0) {
+              // 流れる小川が飛び飛びにならないよう、直近で水が通った床面を連続した浅瀬として維持
+              const hasSupport =
+                bz === 0 ||
+                blocks[idx - layerStride] !== BLOCK_AIR ||
+                water[idx - layerStride] > 0 ||
+                streamFall[idx - layerStride] > 0;
+              if (hasSupport) {
+                visLevel = Math.max(visLevel, 2);
+              }
+            }
+          }
+
+          // Gチャンネルフラグ: bit0=滝落下, bit1=固体, bit2=溶岩, bit3=松明, bit4=木(幹/葉), bit5=葉, bit6-7=草花
           const flags =
-            (falling[idx] ? 1 : 0) |
+            isFall |
             (b !== BLOCK_AIR ? 2 : 0) |
             (b === BLOCK_LAVA ? 4 : 0) |
             (torches[idx] ? 8 : 0) |
@@ -1396,6 +1430,10 @@
     function resetWaterToHighlands() {
       water.fill(0);
       falling.fill(0);
+      streamWet.fill(0);
+      streamFall.fill(0);
+      trailActive.fill(0);
+      trailCount = 0;
       layerHasWater.fill(0);
       dirtyWaterLayers.fill(1);
       waterSettled = false;
@@ -1485,8 +1523,46 @@
 
       let totalMoved = 0;
       let visualChanged = false;
+      const layerStride = WORLD_X * WORLD_Y;
 
-      // 0. 山の上の泉から少しずつ水が湧き出し続ける
+      function touchTrail(idx, wetVal, fallVal) {
+        if (wetVal > streamWet[idx]) streamWet[idx] = wetVal;
+        if (fallVal > streamFall[idx]) streamFall[idx] = fallVal;
+        if (!trailActive[idx]) {
+          trailActive[idx] = 1;
+          trailList[trailCount++] = idx;
+        }
+      }
+
+      // 流路トレイルをアクティブな数百マスだけ高速減衰（23万マス全走査を回避！）
+      let writeIdx = 0;
+      for (let k = 0; k < trailCount; k++) {
+        const idx = trailList[k];
+        const z = Math.floor(idx / layerStride);
+        if (streamWet[idx] > 0) {
+          streamWet[idx]--;
+          if (streamWet[idx] === 0 && water[idx] === 0) {
+            visualChanged = true;
+            markBlockWaterDirty(z);
+          }
+        }
+        if (streamFall[idx] > 0) {
+          streamFall[idx]--;
+          if (streamFall[idx] === 0) {
+            visualChanged = true;
+            markBlockWaterDirty(z);
+            if (z > 0) markBlockWaterDirty(z - 1);
+          }
+        }
+        if (streamWet[idx] > 0 || streamFall[idx] > 0) {
+          trailList[writeIdx++] = idx;
+        } else {
+          trailActive[idx] = 0;
+        }
+      }
+      trailCount = writeIdx;
+
+      // 0. 山の上の泉から少しずつ水が湧き出し続ける（毎ステップ少量ずつ安定湧出）
       for (let s = 0; s < springs.length; s++) {
         const sp = springs[s];
         if (simTick % sp.interval !== 0) continue;
@@ -1495,6 +1571,7 @@
           const prevVis = waterToVisualLevel(water[si]);
           const add = Math.min(sp.rate, WATER_MAX - water[si]);
           water[si] += add;
+          touchTrail(si, 14, 0);
           layerHasWater[sp.z] = 1;
           waterSettled = false;
           totalMoved += add;
@@ -1522,13 +1599,40 @@
         if (amount <= 0) return;
         const prevSrcVis = waterToVisualLevel(water[srcIdx]);
         const prevDstVis = waterToVisualLevel(water[dstIdx]);
+        const wasSrcWet = streamWet[srcIdx] > 0;
+        const wasDstWet = streamWet[dstIdx] > 0;
         water[srcIdx] -= amount;
         water[dstIdx] += amount;
         totalMoved += amount;
         layerHasWater[dstZ] = 1;
+
+        // 通過した流路に小川トレイルを刻み、飛び飛びにならない連続した流れにする
+        if (dstZ < srcZ) {
+          if (streamFall[srcIdx] === 0 || streamFall[dstIdx] === 0) {
+            visualChanged = true;
+            markBlockWaterDirty(srcZ);
+            markBlockWaterDirty(dstZ);
+          }
+          touchTrail(srcIdx, 14, 14);
+          touchTrail(dstIdx, 14, 14);
+        } else if (dstZ > 0 && blocks[dstIdx - layerStride] === BLOCK_AIR && water[dstIdx - layerStride] < WATER_MAX) {
+          // 段差の落ち口へ流れ込んだ瞬間から滝カーテンを連続させる
+          if (streamFall[dstIdx] === 0) {
+            visualChanged = true;
+            markBlockWaterDirty(dstZ);
+          }
+          touchTrail(srcIdx, 14, 0);
+          touchTrail(dstIdx, 14, 14);
+        } else {
+          touchTrail(srcIdx, 14, 0);
+          touchTrail(dstIdx, 14, 0);
+        }
+
         if (
           waterToVisualLevel(water[srcIdx]) !== prevSrcVis ||
-          waterToVisualLevel(water[dstIdx]) !== prevDstVis
+          waterToVisualLevel(water[dstIdx]) !== prevDstVis ||
+          !wasSrcWet ||
+          !wasDstWet
         ) {
           visualChanged = true;
           markBlockWaterDirty(srcZ);
@@ -1613,7 +1717,8 @@
                     : Math.floor(hash3(x + simTick * 5, y + simTick * 3, z) * bestCount);
                 const dst = downhillBuf[pick];
                 const room = WATER_MAX - water[dst];
-                const want = w <= 10 ? w : Math.max(4, Math.ceil(w * 0.55));
+                // 少量でも一気に空にして飛び飛びにせず、滑らかに送り出しつつ流れが途切れたら綺麗に引き切る
+                const want = w <= 2 ? w : Math.max(2, Math.ceil(w * 0.65));
                 const flow = Math.min(w, room, want);
                 if (flow > 0) {
                   transfer(i, dst, flow, z, z);

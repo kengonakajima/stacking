@@ -642,6 +642,21 @@
         );
         float alpha = (48.0 + cellEdge * 22.0 + webSharp * 68.0) / 255.0;
 
+        // 流れる小川や滝の落ち口はノイズベースの自然な白波と流れのきらめきで繋げる
+        if (isFalling) {
+          vec2 wp = floor(vBlockPos * 6.0) / 6.0;
+          float nCrest = cloudNoise(wp * 4.2 + vec2(uTime * 1.4, uTime * 2.2));
+          float nFine = cloudNoise(wp * 9.5 - vec2(uTime * 2.8, uTime * 1.9));
+          float foamCrest = smoothstep(0.42, 0.85, nCrest * 0.6 + nFine * 0.4);
+          rgb = mix(rgb, vec3(0.80, 0.96, 1.0), 0.20 + foamCrest * 0.42);
+          alpha = max(alpha, 0.42 + foamCrest * 0.24);
+        } else if (visLevel <= 2) {
+          vec2 wp = floor(vBlockPos * 6.0) / 6.0;
+          float nBrook = cloudNoise(wp * 5.0 + vec2(uTime * 1.6, -uTime * 1.3));
+          rgb = mix(rgb, vec3(0.55, 0.88, 1.0), 0.12 + nBrook * 0.20);
+          alpha = max(alpha, 0.36 + nBrook * 0.16);
+        }
+
         vec2 fxy = fract(vBlockPos);
         float shore = 0.0;
         if (fxy.x < 0.18 && (sampleWaterCell(bxy + ivec2(-1, 0), surfBz).y & 2) != 0) shore = max(shore, 1.0 - fxy.x / 0.18);
@@ -664,8 +679,54 @@
       if (bz < uWorldZ && visLevel >= lz + 1) {
         vec3 lightCol = evalWorldLight(vBlockPos, vSliceZ);
         if (isFalling) {
-          float streak = 0.85 + 0.15 * sin(uTime * 9.0 + float(vSliceZ) * 0.9 + vBlockPos.x * 3.0);
-          outColor = vec4(vec3(0.34, 0.78, 0.95) * streak * lightCol, 0.25);
+          // 多層スクロールノイズによるリアルな滝（縦に伸びた水流の筋＋飛沫＋滝壺の白泡）
+          vec2 wp = floor(vBlockPos * 6.0) / 6.0;
+          vec2 fxy = fract(vBlockPos);
+          float zPos = float(vSliceZ) * 0.125;
+
+          // カメラ角度に依らず自然な横座標を2軸用意し、縦方向へ速度差をつけて落下スクロール
+          float h1 = wp.x * 0.78 + wp.y * 0.62;
+          float h2 = -wp.x * 0.62 + wp.y * 0.78;
+          // わずかな横揺らぎで水筋のうねりを表現（規則的な縞模様を完全に排除）
+          float warp = (cloudNoise(vec2(h1 * 2.4, zPos * 0.7 + uTime * 2.1)) - 0.5) * 0.55;
+
+          // 層1: 太めのうねる水の塊（中速落下）
+          float bodyN = cloudNoise(vec2((h1 + warp) * 3.4 + h2 * 1.3, zPos * 0.48 + uTime * 3.4));
+          // 層2: 細く速く落ちる白水の筋（高速落下・縦に引き伸ばし）
+          float threadN = cloudNoise(vec2((h2 - warp * 0.7) * 7.8 + h1 * 2.1, zPos * 0.85 + uTime * 6.1));
+          // 層3: 細かい飛沫と泡の粒（超高速落下）
+          float sprayN = cloudNoise(vec2(wp.x * 11.5 - wp.y * 9.5, zPos * 1.65 + uTime * 8.4));
+
+          // 滝の側面（空気に触れる外皮）ほど白波・飛沫が立ち、中心は澄んだ青に
+          float edgeDist = min(min(fxy.x, 1.0 - fxy.x), min(fxy.y, 1.0 - fxy.y));
+          float outerSkin = 1.0 - smoothstep(0.05, 0.34, edgeDist);
+
+          // 滝壺（真下が水たまりや岩床で着水する箇所）の激しい白泡・水しぶき
+          ivec2 belowCell = sampleWaterCell(bxy, bz - 1);
+          bool isImpactZone = (bz == 0) || ((belowCell.y & 2) != 0) || ((belowCell.y & 1) == 0);
+          float impactSplash = 0.0;
+          if (isImpactZone && lz <= 4) {
+            float splashBase = 1.0 - float(lz) / 4.5;
+            float splashChurn = cloudNoise(vec2(wp.x * 7.0 + wp.y * 5.0, uTime * 5.2 + float(lz) * 0.6));
+            impactSplash = splashBase * (0.45 + 0.55 * splashChurn);
+          }
+
+          // 水筋・泡・飛沫を合成
+          float ribbon = smoothstep(0.46, 0.84, bodyN * 0.52 + threadN * 0.48);
+          float sparkle = smoothstep(0.66, 0.90, sprayN) * (0.4 + 0.6 * outerSkin);
+          float foam = clamp(ribbon * (0.45 + 0.55 * outerSkin) + sparkle * 0.55 + impactSplash * 0.85, 0.0, 1.0);
+
+          // 深いサファイア青 → 明るいシアン → 白泡の自然なグラデーション
+          vec3 deepWater = vec3(0.09, 0.42, 0.74);
+          vec3 midCyan = vec3(0.26, 0.72, 0.93);
+          vec3 whiteFoam = vec3(0.88, 0.97, 1.0);
+          vec3 fallCol = mix(deepWater, midCyan, clamp(bodyN * 1.15, 0.0, 1.0));
+          fallCol = mix(fallCol, whiteFoam, foam * 0.78);
+
+          // 外周の輪郭にノイズによる自然な揺らぎ・透け感を入れて棒状っぽさを和らげる
+          float edgeBreak = smoothstep(0.0, 0.14, edgeDist + (bodyN - 0.45) * 0.16 + impactSplash * 0.12);
+          float fallAlpha = (0.16 + bodyN * 0.12 + foam * 0.30) * mix(0.55, 1.0, edgeBreak);
+          outColor = vec4(fallCol * lightCol, clamp(fallAlpha, 0.10, 0.68));
         } else {
           outColor = vec4(vec3(0.04, 0.36, 0.68) * lightCol, 0.078);
         }
